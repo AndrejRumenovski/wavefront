@@ -1,0 +1,67 @@
+[package]
+name = "wavefront"
+version = "0.1.0"
+edition = "2021"
+authors = ["Wavefront HPC Contributors"]
+description = "Asynchronous, out-of-core 3D FDTD electromagnetic simulator for dense voxelized structures on a single workstation."
+license = "MIT OR Apache-2.0"
+
+# =============================================================================
+# BUILD & TOOLCHAIN REQUIREMENTS
+# =============================================================================
+#
+# This crate requires a NIGHTLY toolchain. The Yee-lattice update kernels in
+# `src/fdtd.rs` are written against `std::simd` (the `portable_simd` feature),
+# which is not yet stabilized:
+#
+#   rustup override set nightly
+#
+# It also requires a Linux host: the out-of-core snapshot writer in
+# `src/engine.rs` talks directly to `io_uring` (via the `rio` crate) using
+# `O_DIRECT`, and expects:
+#
+#   - Linux kernel >= 5.6 (io_uring availability), ideally >= 5.11 so that
+#     larger, registered-buffer writes stay fully async.
+#   - An NVMe SSD (or comparably low-latency block device) backing the
+#     `wave_trajectory.bin` output path, mounted on a filesystem that
+#     supports O_DIRECT (ext4, xfs, btrfs all do; tmpfs and some network
+#     filesystems do not).
+#
+# ALWAYS build and run in release mode with native CPU vectorization turned
+# on -- this is not optional, it is the difference between the scalar
+# fallback path and real AVX2 `f32x8` throughput in the Maxwell solver's
+# inner neighborhood scans:
+#
+#   RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
+#       cargo +nightly build --release
+#
+# `target-cpu=native` lets LLVM pick the widest vector width/ISA extensions
+# actually present on the build host (AVX2, FMA, and AVX-512 where
+# available); `target-feature=+avx2` is a floor guarantee in case a
+# virtualized/cloud host under-reports `target-cpu`. Because the resulting
+# binary is tuned to the exact machine it was built on, do NOT copy it to a
+# different microarchitecture -- rebuild there instead.
+#
+# Note on licensing: the `rio` crate is GPL-3.0 by default (a permissive
+# MIT/Apache-2.0 dual license is available by sponsoring the author). Confirm
+# this is acceptable for your deployment before shipping a binary built
+# against it.
+# =============================================================================
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[dependencies]
+memmap2 = "=0.9.4"
+rio = "=0.9.4"
+rayon = "=1.10.0"
+crossbeam-channel = "=0.5.16"
+
+# Pinned to exact versions (per the mandate above) so a release build is
+# fully reproducible across machines. Bump deliberately, not via `cargo
+# update`, and re-verify the `unsafe` boundary code in `src/layout.rs` and
+# `src/engine.rs` still matches each crate's documented safety contract
+# after any bump.

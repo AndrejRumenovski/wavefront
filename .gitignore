@@ -1,0 +1,6 @@
+/target
+
+# Generated at runtime -- the mmap'd material grid and the out-of-core
+# snapshot stream -- neither belongs in version control.
+/materials.grid
+/wave_trajectory.bin
