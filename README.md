@@ -24,6 +24,13 @@ RAM), on a single Linux workstation.
 - I/O: field snapshots are streamed out via double-buffered, `O_DIRECT`
   `io_uring` writes (through the `rio` crate), so storage latency never
   stalls the timestep loop (`src/engine.rs`).
+- Excitation: one or more point soft sources drive a field component every
+  timestep with a configurable time-domain waveform (Gaussian pulse,
+  sinusoid, or Ricker wavelet) -- not just a one-shot initial condition
+  (`src/source.rs`).
+- Geometry: structures can be described in a small plain-text scene format
+  (spheres and boxes tagged with material constants) and voxelized into the
+  material grid, instead of only the hardcoded demo sphere (`src/scene.rs`).
 
 ## Requirements
 
@@ -74,9 +81,10 @@ or invoke the built binary directly:
 ./target/release/wavefront [OPTIONS]
 ```
 
-The demo scenario voxelizes a dielectric sphere (`eps_r = 4.0`) at the
-center of an otherwise-vacuum domain, injects a Gaussian pulse into `Ez` at
-t=0, and lets the solver propagate it.
+Absent `--scene`, the demo scenario voxelizes a dielectric sphere
+(`eps_r = 4.0`) at the center of an otherwise-vacuum domain. A single point
+source (default: a Ricker wavelet on `Ez` at the domain center) is
+re-injected every timestep.
 
 ### Options
 
@@ -88,6 +96,12 @@ t=0, and lets the solver propagate it.
 | `--steps`               | Number of timesteps to run                            | `200`                |
 | `--snapshot-every`      | Timesteps between snapshot writes                     | `20`                 |
 | `--pml-thickness <N>`  | Absorbing boundary depth, in voxels, at each domain face. `0` disables it (fully reflective boundary) | `8` |
+| `--scene <PATH>`        | Plain-text scene file (see below); omit for the demo sphere | (demo sphere) |
+| `--source-x/-y/-z <N>`  | Source voxel position                                | domain center        |
+| `--source-component <C>`| Field component the source drives: `ex`, `ey`, `ez`  | `ez`                 |
+| `--source-waveform <W>` | `gaussian`, `sinusoid`, or `ricker`                   | `ricker`             |
+| `--source-freq <HZ>`    | Source drive frequency                                | `1 / (20 * dt)`      |
+| `--source-amplitude <A>`| Source peak amplitude                                 | `1.0`                |
 | `--materials <PATH>`    | Backing file for the mmap'd material grid             | `materials.grid`     |
 | `--output <PATH>`       | Direct I/O snapshot stream path                       | `wave_trajectory.bin`|
 | `-h`, `--help`          | Print usage                                           |                      |
@@ -97,6 +111,8 @@ t=0, and lets the solver propagate it.
 ```sh
 ./target/release/wavefront --nx 128 --ny 128 --nz 128 \
     --steps 500 --snapshot-every 25 \
+    --scene scenes/two_spheres.scene \
+    --source-waveform sinusoid --source-freq 3e10 \
     --materials /mnt/nvme/materials.grid \
     --output /mnt/nvme/wave_trajectory.bin
 ```
@@ -105,9 +121,45 @@ t=0, and lets the solver propagate it.
 run time (see `.gitignore`) — point `--materials`/`--output` at your NVMe
 mount for large grids rather than leaving the defaults in the repo checkout.
 
+### Scene format
+
+`--scene` loads a plain-text file describing geometric primitives, applied
+in order (later ones overwrite earlier ones where they overlap). Geometric
+parameters are in voxel-index units, not meters:
+
+```text
+# comment
+sphere <eps_r> <mu_r> <sigma> <cx> <cy> <cz> <radius>
+box    <eps_r> <mu_r> <sigma> <x0> <y0> <z0> <x1> <y1> <z1>
+```
+
+See `scenes/two_spheres.scene` for a working example. Each distinct
+`(eps_r, mu_r, sigma)` triple gets its own material slot automatically (up
+to 255 non-vacuum materials).
+
 ### Output format
 
 `wave_trajectory.bin` is a raw concatenation of snapshots; each snapshot is
 every `FieldBlock` in the grid, in block-major (Z, then Y, then X) order,
 each block serialized as six back-to-back `f32` arrays (`Ex, Ey, Ez, Hx, Hy,
 Hz`), 512 voxels per array (8x8x8 block, row-major with X fastest-varying).
+
+## Tests
+
+```sh
+RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
+    cargo +nightly test --release
+```
+
+Covers: fixed-point round-tripping, material/PML coefficient formulas
+against their closed forms, Yee kernel invariants (a uniform field has zero
+curl and is left unchanged), scene parsing, source waveform shapes, and an
+end-to-end numerical check that a point source in vacuum radiates outward
+at approximately the speed of light. The propagation-speed test calls the
+per-slab solver directly rather than going through `engine::run`, so it has
+no `O_DIRECT`/filesystem dependency and can't be flaky in a sandboxed CI
+environment.
+
+CI (`.github/workflows/ci.yml`) builds and tests on nightly with the same
+`RUSTFLAGS` as local development, on every push to `main` and every pull
+request.

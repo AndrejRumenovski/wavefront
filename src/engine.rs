@@ -37,9 +37,10 @@
 
 use crate::fdtd::{self, EUpdateNeighbors, HUpdateNeighbors};
 use crate::layout::{
-    CoeffGrid, FieldBlock, FieldGrid, MaterialCoeffs, PmlAux, PmlAuxGrid, PmlContext,
+    CoeffGrid, FieldBlock, FieldGrid, MaterialCoeffs, PmlAux, PmlAuxGrid, PmlContext, BLOCK_DIM,
     VOXELS_PER_BLOCK,
 };
+use crate::source::Source;
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
@@ -363,6 +364,9 @@ const O_DIRECT: i32 = 0o40000;
 pub struct EngineConfig {
     pub num_steps: usize,
     pub snapshot_every: usize,
+    /// Timestep, in seconds -- needed here (not just at setup) so source
+    /// waveforms can be evaluated at the correct simulation time each step.
+    pub dt: f32,
     pub output_path: PathBuf,
 }
 
@@ -406,6 +410,7 @@ pub fn run(
     coeff_grid: &CoeffGrid,
     pml: Option<&PmlContext>,
     pml_aux: &mut PmlAuxGrid,
+    sources: &[Source],
     config: &EngineConfig,
 ) -> io::Result<()> {
     let dims = field_grid.dims();
@@ -548,6 +553,18 @@ pub fn run(
                 }
             });
 
+        // ---- source injection --------------------------------------------
+        //
+        // Soft sources are re-applied every timestep, after the E-field
+        // update completes -- each one only ever touches the single voxel
+        // it lives at, so this runs single-threaded with no meaningful
+        // cost regardless of grid size. `t` is the simulation time the E
+        // field now represents, one full timestep past its initial state.
+        let t = (step as f32 + 1.0) * config.dt;
+        for source in sources {
+            source.inject(field_grid, t);
+        }
+
         if step % config.snapshot_every == 0 {
             // Reclaim this buffer slot: wait only if the write that
             // previously used it hasn't finished yet. With two buffers,
@@ -585,4 +602,118 @@ pub fn run(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{GridDims, MaterialGrid, MaterialTable};
+    use crate::source::{FieldComponent, Source, Waveform};
+
+    const SPEED_OF_LIGHT_M_PER_S: f32 = 299_792_458.0;
+
+    /// Numerical correctness check: a point source in vacuum should radiate
+    /// outward at (approximately) the speed of light. This exercises the
+    /// solver directly -- `update_slab_h`/`update_slab_e` treating the whole
+    /// grid as one slab, with PML disabled -- deliberately bypassing
+    /// `run`'s rayon/crossbeam/rio machinery so the test has no filesystem
+    /// or `O_DIRECT` dependency and can't be flaky in a CI sandbox that
+    /// doesn't support Direct I/O.
+    ///
+    /// FDTD has numerical dispersion (grid-driven group velocity error), so
+    /// this allows a generous tolerance -- it's meant to catch a badly wrong
+    /// update equation (wrong sign, wrong constant, factor-of-two error),
+    /// not to be a tight dispersion-accuracy benchmark.
+    #[test]
+    fn wave_propagates_at_approximately_speed_of_light() {
+        let dims = GridDims::new(64, 64, 64);
+        let dx = 1.0e-3_f32;
+        let dt = 1.5e-12_f32; // Courant number ~0.45, comfortably stable.
+        let table = MaterialTable::vacuum_filled(dt, dx);
+
+        let path = std::env::temp_dir().join(format!(
+            "wavefront_test_materials_{}_{:?}.grid",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let material_grid = MaterialGrid::create(&path, dims).expect("create test material grid");
+        let coeff_grid = CoeffGrid::build(&material_grid, &table);
+        let _ = std::fs::remove_file(&path);
+
+        let mut field_grid = FieldGrid::zeroed(dims);
+        let (bx_n, by_n, bz_n) = dims.block_dims();
+        let plane = bx_n * by_n;
+        let zero_plane = vec![FieldBlock::ZERO; plane];
+        let mut pml_aux = PmlAuxGrid::build(dims, 0);
+
+        let center = (dims.nx / 2, dims.ny / 2, dims.nz / 2);
+        let freq_hz = 3.0e10_f32;
+        let source = Source {
+            x: center.0,
+            y: center.1,
+            z: center.2,
+            component: FieldComponent::Ez,
+            amplitude: 1.0,
+            waveform: Waveform::RickerWavelet {
+                peak_freq_hz: freq_hz,
+                t0: 1.0 / freq_hz,
+            },
+        };
+
+        // Probe 20 voxels away along +X -- well before any wall reflection
+        // could contaminate the reading (the domain edge is 32 voxels out).
+        let probe_x = center.0 + 20;
+        let (probe_bx, probe_by, probe_bz) = (probe_x / BLOCK_DIM, center.1 / BLOCK_DIM, center.2 / BLOCK_DIM);
+        let probe_local =
+            FieldBlock::local_index(probe_x % BLOCK_DIM, center.1 % BLOCK_DIM, center.2 % BLOCK_DIM);
+
+        let expected_time_s = (20.0 * dx) / SPEED_OF_LIGHT_M_PER_S;
+        let threshold = 5.0e-4;
+        let max_steps = 200;
+        let mut arrival_step: Option<usize> = None;
+
+        for step in 0..max_steps {
+            update_slab_h(
+                field_grid.blocks_mut(),
+                coeff_grid.blocks(),
+                pml_aux.blocks_mut(),
+                None,
+                bx_n,
+                by_n,
+                bz_n,
+                0,
+                &zero_plane,
+            );
+            update_slab_e(
+                field_grid.blocks_mut(),
+                coeff_grid.blocks(),
+                pml_aux.blocks_mut(),
+                None,
+                bx_n,
+                by_n,
+                bz_n,
+                0,
+                &zero_plane,
+            );
+
+            let t = (step as f32 + 1.0) * dt;
+            source.inject(&mut field_grid, t);
+
+            let probe_value = field_grid.block(probe_bx, probe_by, probe_bz).ez[probe_local];
+            if arrival_step.is_none() && probe_value.abs() > threshold {
+                arrival_step = Some(step);
+                break;
+            }
+        }
+
+        let arrival_step = arrival_step.expect("wave never reached the probe point within max_steps");
+        let measured_time_s = (arrival_step as f32 + 1.0) * dt;
+
+        let relative_error = (measured_time_s - expected_time_s).abs() / expected_time_s;
+        assert!(
+            relative_error < 0.20,
+            "measured arrival time {measured_time_s:e}s vs expected {expected_time_s:e}s \
+             (speed of light over 20 voxels) -- relative error {relative_error:.3} exceeds 20%"
+        );
+    }
 }

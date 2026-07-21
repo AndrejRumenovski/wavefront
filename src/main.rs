@@ -7,20 +7,21 @@
 //!   - `engine`: spatial decomposition, rayon scheduling, crossbeam halo
 //!     exchange, and the `io_uring` snapshot writer.
 //!
-//! It sets up a single demonstration scenario -- a dielectric sphere
-//! embedded in vacuum, excited by a Gaussian point source at the domain
-//! center -- and runs the timestep loop to completion.
+//! Absent a `--scene` file, it falls back to a single demonstration
+//! scenario -- a dielectric sphere embedded in vacuum -- excited by a
+//! configurable point source (default: a Ricker wavelet on Ez at the
+//! domain center) re-injected every timestep.
 
 #![feature(portable_simd)]
 
 mod engine;
 mod fdtd;
 mod layout;
+mod scene;
+mod source;
 
-use layout::{
-    CoeffGrid, FieldGrid, GridDims, MaterialGrid, MaterialId, MaterialTable, PmlConfig,
-    PmlContext, BLOCK_DIM,
-};
+use layout::{CoeffGrid, FieldGrid, GridDims, MaterialGrid, MaterialId, MaterialTable, PmlConfig, PmlContext, BLOCK_DIM};
+use source::{FieldComponent, Source, Waveform};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -41,8 +42,29 @@ struct Config {
     /// domain faces. `0` disables the PML and reverts to a zero-field
     /// (fully reflective) boundary.
     pml_thickness: usize,
+    /// Optional plain-text scene file (see `src/scene.rs`); falls back to
+    /// the hardcoded demo sphere if not given.
+    scene_path: Option<PathBuf>,
+    /// Source voxel position; defaults to the domain center if unset.
+    source_pos: (Option<usize>, Option<usize>, Option<usize>),
+    source_component: FieldComponent,
+    source_waveform: WaveformKind,
+    /// Source drive frequency, in Hz; defaults to `1 / (20 * dt)` (20
+    /// samples per period) if unset.
+    source_freq: Option<f32>,
+    source_amplitude: f32,
     materials_path: PathBuf,
     output_path: PathBuf,
+}
+
+/// CLI-selectable source waveform shape. Translated into a concrete
+/// `source::Waveform` (with its `t0`/`spread` parameters derived from the
+/// drive frequency) once `dt` is known -- see [`build_waveform`].
+#[derive(Debug, Clone, Copy)]
+enum WaveformKind {
+    Gaussian,
+    Sinusoid,
+    Ricker,
 }
 
 impl Default for Config {
@@ -56,6 +78,12 @@ impl Default for Config {
             num_steps: 200,
             snapshot_every: 20,
             pml_thickness: PmlConfig::default().thickness,
+            scene_path: None,
+            source_pos: (None, None, None),
+            source_component: FieldComponent::Ez,
+            source_waveform: WaveformKind::Ricker,
+            source_freq: None,
+            source_amplitude: 1.0,
             materials_path: PathBuf::from("materials.grid"),
             output_path: PathBuf::from("wave_trajectory.bin"),
         }
@@ -75,6 +103,12 @@ fn print_usage() {
          \x20   --steps <N>            number of timesteps to run [default: 200]\n\
          \x20   --snapshot-every <N>   timesteps between snapshot writes [default: 20]\n\
          \x20   --pml-thickness <N>    absorbing boundary depth in voxels, 0 disables it [default: 8]\n\
+         \x20   --scene <PATH>         plain-text scene file (see src/scene.rs); omit for the demo sphere\n\
+         \x20   --source-x/-y/-z <N>   source voxel position [default: domain center]\n\
+         \x20   --source-component <C> field component the source drives: ex, ey, ez [default: ez]\n\
+         \x20   --source-waveform <W>  gaussian, sinusoid, or ricker [default: ricker]\n\
+         \x20   --source-freq <HZ>     source drive frequency [default: 1/(20*dt)]\n\
+         \x20   --source-amplitude <A> source peak amplitude [default: 1.0]\n\
          \x20   --materials <PATH>     backing file for the mmap'd material grid [default: materials.grid]\n\
          \x20   --output <PATH>        Direct I/O snapshot stream path [default: wave_trajectory.bin]\n\
          \x20   -h, --help             print this message"
@@ -111,6 +145,36 @@ fn parse_args() -> Result<Config, String> {
             }
             "--pml-thickness" => {
                 config.pml_thickness = parse_num("--pml-thickness", next_value("--pml-thickness")?)?
+            }
+            "--scene" => config.scene_path = Some(PathBuf::from(next_value("--scene")?)),
+            "--source-x" => config.source_pos.0 = Some(parse_num("--source-x", next_value("--source-x")?)?),
+            "--source-y" => config.source_pos.1 = Some(parse_num("--source-y", next_value("--source-y")?)?),
+            "--source-z" => config.source_pos.2 = Some(parse_num("--source-z", next_value("--source-z")?)?),
+            "--source-component" => {
+                let v = next_value("--source-component")?;
+                config.source_component = match v.as_str() {
+                    "ex" => FieldComponent::Ex,
+                    "ey" => FieldComponent::Ey,
+                    "ez" => FieldComponent::Ez,
+                    other => return Err(format!("invalid --source-component: {other} (expected ex, ey, or ez)")),
+                };
+            }
+            "--source-waveform" => {
+                let v = next_value("--source-waveform")?;
+                config.source_waveform = match v.as_str() {
+                    "gaussian" => WaveformKind::Gaussian,
+                    "sinusoid" => WaveformKind::Sinusoid,
+                    "ricker" => WaveformKind::Ricker,
+                    other => {
+                        return Err(format!(
+                            "invalid --source-waveform: {other} (expected gaussian, sinusoid, or ricker)"
+                        ))
+                    }
+                };
+            }
+            "--source-freq" => config.source_freq = Some(parse_float("--source-freq", next_value("--source-freq")?)?),
+            "--source-amplitude" => {
+                config.source_amplitude = parse_float("--source-amplitude", next_value("--source-amplitude")?)?
             }
             "--materials" => config.materials_path = PathBuf::from(next_value("--materials")?),
             "--output" => config.output_path = PathBuf::from(next_value("--output")?),
@@ -154,39 +218,39 @@ fn voxelize_demo_sphere(grid: &mut MaterialGrid) {
     }
 }
 
-/// Injects a Gaussian-in-space impulse into Ez at the domain center as the
-/// initial condition, giving the solver something physically meaningful to
-/// propagate.
-fn inject_initial_pulse(field_grid: &mut FieldGrid, dims: GridDims) {
-    let (cx, cy, cz) = (dims.nx / 2, dims.ny / 2, dims.nz / 2);
-    let sigma: f32 = 2.0;
-    let sigma_sq = sigma * sigma;
+/// Builds the single configured [`Source`] from CLI options, resolving its
+/// position to the domain center and its frequency to `1/(20*dt)` wherever
+/// the user didn't override them, and translating the CLI's waveform
+/// *shape* selection into concrete `t0`/`spread` parameters derived from
+/// that frequency.
+fn build_source(config: &Config, dims: GridDims) -> Source {
+    let x = config.source_pos.0.unwrap_or(dims.nx / 2);
+    let y = config.source_pos.1.unwrap_or(dims.ny / 2);
+    let z = config.source_pos.2.unwrap_or(dims.nz / 2);
+    let freq_hz = config.source_freq.unwrap_or(1.0 / (20.0 * config.dt));
 
-    let spread = (3.0 * sigma).ceil() as isize;
-    for dz in -spread..=spread {
-        for dy in -spread..=spread {
-            for dx in -spread..=spread {
-                let x = cx as isize + dx;
-                let y = cy as isize + dy;
-                let z = cz as isize + dz;
-                if x < 0 || y < 0 || z < 0 {
-                    continue;
-                }
-                let (x, y, z) = (x as usize, y as usize, z as usize);
-                if x >= dims.nx || y >= dims.ny || z >= dims.nz {
-                    continue;
-                }
-                let r_sq = (dx * dx + dy * dy + dz * dz) as f32;
-                let amplitude = (-r_sq / (2.0 * sigma_sq)).exp();
-
-                let bx = x / BLOCK_DIM;
-                let by = y / BLOCK_DIM;
-                let bz = z / BLOCK_DIM;
-                let (lx, ly, lz) = (x % BLOCK_DIM, y % BLOCK_DIM, z % BLOCK_DIM);
-                let local = layout::FieldBlock::local_index(lx, ly, lz);
-                field_grid.block_mut(bx, by, bz).ez[local] = amplitude;
+    let waveform = match config.source_waveform {
+        WaveformKind::Sinusoid => Waveform::Sinusoid { freq_hz },
+        WaveformKind::Ricker => Waveform::RickerWavelet {
+            peak_freq_hz: freq_hz,
+            t0: 1.0 / freq_hz,
+        },
+        WaveformKind::Gaussian => {
+            let spread = 0.5 / freq_hz;
+            Waveform::GaussianPulse {
+                t0: 4.0 * spread,
+                spread,
             }
         }
+    };
+
+    Source {
+        x,
+        y,
+        z,
+        component: config.source_component,
+        amplitude: config.source_amplitude,
+        waveform,
     }
 }
 
@@ -208,18 +272,31 @@ fn run(config: Config) -> Result<(), String> {
 
     let mut material_grid = MaterialGrid::create(&config.materials_path, dims)
         .map_err(|e| format!("failed to create material grid at {:?}: {e}", config.materials_path))?;
-    voxelize_demo_sphere(&mut material_grid);
+    let mut material_table = MaterialTable::vacuum_filled(config.dt, config.dx);
+
+    match &config.scene_path {
+        Some(path) => {
+            let scene = scene::Scene::load(path)?;
+            let n_materials = scene.voxelize(&mut material_grid, &mut material_table, config.dt, config.dx)?;
+            eprintln!("wavefront: loaded scene {path:?} ({n_materials} distinct materials)");
+        }
+        None => {
+            voxelize_demo_sphere(&mut material_grid);
+            material_table.set_material(MATERIAL_DIELECTRIC, 4.0, 1.0, 0.0, config.dt, config.dx);
+        }
+    }
     material_grid
         .flush()
         .map_err(|e| format!("failed to flush material grid: {e}"))?;
 
-    let mut material_table = MaterialTable::vacuum_filled(config.dt, config.dx);
-    material_table.set_material(MATERIAL_DIELECTRIC, 4.0, 1.0, 0.0, config.dt, config.dx);
-
     let coeff_grid = CoeffGrid::build(&material_grid, &material_table);
 
     let mut field_grid = FieldGrid::zeroed(dims);
-    inject_initial_pulse(&mut field_grid, dims);
+    let source = build_source(&config, dims);
+    eprintln!(
+        "wavefront: source at ({}, {}, {}) driving {:?}, {:?}",
+        source.x, source.y, source.z, source.component, source.waveform
+    );
 
     let pml_config = PmlConfig {
         thickness: config.pml_thickness,
@@ -231,6 +308,7 @@ fn run(config: Config) -> Result<(), String> {
     let engine_config = engine::EngineConfig {
         num_steps: config.num_steps,
         snapshot_every: config.snapshot_every.max(1),
+        dt: config.dt,
         output_path: config.output_path,
     };
 
@@ -239,6 +317,7 @@ fn run(config: Config) -> Result<(), String> {
         &coeff_grid,
         pml_context_ref,
         &mut pml_aux_grid,
+        &[source],
         &engine_config,
     )
     .map_err(|e| format!("simulation run failed: {e}"))

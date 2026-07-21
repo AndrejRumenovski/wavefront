@@ -1,0 +1,6 @@
+# Example wavefront scene: two dielectric spheres and a low-loss slab.
+# format: sphere <eps_r> <mu_r> <sigma> <cx> <cy> <cz> <radius>
+#         box    <eps_r> <mu_r> <sigma> <x0> <y0> <z0> <x1> <y1> <z1>
+sphere 4.0 1.0 0.0   16 16 10   6
+sphere 2.1 1.0 0.0   16 16 22   4
+box    1.0 1.0 0.05   4 4 26   28 28 30

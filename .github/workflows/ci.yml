@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # Same flags Cargo.toml's build instructions require locally -- CI builds
+  # and runs on the same runner instance, so `target-cpu=native` is safe
+  # here (no cross-machine binary portability concerns like a real release
+  # artifact would have).
+  RUSTFLAGS: "-C target-cpu=native -C target-feature=+avx2"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup override set nightly
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (release)
+        run: cargo build --release --verbose
+
+      - name: Test (release)
+        run: cargo test --release --verbose

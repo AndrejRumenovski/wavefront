@@ -775,3 +775,114 @@ impl FieldGrid {
         &self.blocks
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_point_round_trips() {
+        for v in [0.0f32, 1.0, -1.0, 0.5, -0.5, 123.456, -999.999, 3.0e-4] {
+            let q = FixedQ16_16::from_f32(v);
+            // Q16.16 has ~1/65536 resolution; allow a couple of ULPs at that scale.
+            assert!(
+                (q.to_f32() - v).abs() < 2.0e-4 * v.abs().max(1.0),
+                "round-trip of {v} gave {}",
+                q.to_f32()
+            );
+        }
+    }
+
+    #[test]
+    fn vacuum_material_coeffs_match_closed_form() {
+        let dt = 1.5e-12_f32;
+        let dx = 1.0e-3_f32;
+        let table = MaterialTable::vacuum_filled(dt, dx);
+        let c = table.get(MaterialId::VACUUM);
+
+        // Lossless vacuum: Ca = Da = 1 exactly (no conductive loss term).
+        assert!((c.ca.to_f32() - 1.0).abs() < 1.0e-4);
+        assert!((c.da.to_f32() - 1.0).abs() < 1.0e-4);
+
+        // Cb = dt / (eps0 * dx), Db = dt / (mu0 * dx).
+        let expected_cb = dt / (EPS0 * dx);
+        let expected_db = dt / (MU0 * dx);
+        assert!(
+            (c.cb.to_f32() - expected_cb).abs() < expected_cb * 5.0e-2,
+            "cb: got {}, expected {expected_cb}",
+            c.cb.to_f32()
+        );
+        assert!(
+            (c.db.to_f32() - expected_db).abs() < expected_db * 5.0e-2,
+            "db: got {}, expected {expected_db}",
+            c.db.to_f32()
+        );
+    }
+
+    #[test]
+    fn lossy_material_ca_is_between_zero_and_one() {
+        let dt = 1.5e-12_f32;
+        let dx = 1.0e-3_f32;
+        let mut table = MaterialTable::vacuum_filled(dt, dx);
+        let lossy = MaterialId(5);
+        table.set_material(lossy, 2.0, 1.0, 0.02, dt, dx);
+        let c = table.get(lossy);
+        assert!(c.ca.to_f32() > 0.0 && c.ca.to_f32() < 1.0);
+    }
+
+    #[test]
+    fn pml_disabled_gives_identity_everywhere() {
+        let profile = PmlProfile1D::build(64, &PmlConfig::default(), 1.5e-12, 1.0e-3, 0);
+        for i in 0..64 {
+            let c = profile.get(i);
+            assert_eq!(c.b, 1.0);
+            assert_eq!(c.a, 0.0);
+            assert_eq!(c.inv_kappa, 1.0);
+        }
+    }
+
+    #[test]
+    fn pml_interior_is_identity_and_edges_are_graded() {
+        let config = PmlConfig::default();
+        let n = 64;
+        let thickness = 8;
+        let profile = PmlProfile1D::build(n, &config, 1.5e-12, 1.0e-3, thickness);
+
+        // Deep interior: untouched by either face's grading.
+        let mid = profile.get(n / 2);
+        assert_eq!(mid.b, 1.0);
+        assert_eq!(mid.a, 0.0);
+        assert_eq!(mid.inv_kappa, 1.0);
+
+        // The true edge (index 0) should have nontrivial stretching: kappa > 1
+        // (so inv_kappa < 1) and a nonzero recursive-convolution coefficient.
+        let edge = profile.get(0);
+        assert!(edge.inv_kappa < 1.0, "expected kappa > 1 at the PML edge");
+        assert_ne!(edge.a, 0.0, "expected a nonzero convolution coefficient at the PML edge");
+        assert!(edge.b > 0.0 && edge.b < 1.0, "expected 0 < b < 1 at the PML edge");
+
+        // Low- and high-side faces are graded symmetrically.
+        let high_edge = profile.get(n - 1);
+        assert_eq!(edge.b, high_edge.b);
+        assert_eq!(edge.a, high_edge.a);
+        assert_eq!(edge.inv_kappa, high_edge.inv_kappa);
+    }
+
+    #[test]
+    fn effective_pml_thickness_clamps_to_grid_size() {
+        let dims = GridDims::new(16, 16, 16); // 2x2x2 blocks
+        // Requesting far more than the grid can support clamps to at most
+        // half the shortest axis in blocks (1 block here), not zero.
+        assert_eq!(effective_pml_thickness_blocks(dims, 1000), 1);
+        // Explicitly disabled stays disabled.
+        assert_eq!(effective_pml_thickness_blocks(dims, 0), 0);
+    }
+
+    #[test]
+    fn grid_dims_block_accounting() {
+        let dims = GridDims::new(32, 16, 8);
+        assert_eq!(dims.voxel_count(), 32 * 16 * 8);
+        assert_eq!(dims.block_dims(), (4, 2, 1));
+        assert_eq!(dims.block_count(), 4 * 2 * 1);
+    }
+}

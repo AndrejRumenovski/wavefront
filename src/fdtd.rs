@@ -503,3 +503,123 @@ pub fn update_e_field_pml(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::FixedQ16_16;
+
+    fn uniform_block(ex: f32, ey: f32, ez: f32, hx: f32, hy: f32, hz: f32) -> FieldBlock {
+        FieldBlock {
+            ex: [ex; VOXELS_PER_BLOCK],
+            ey: [ey; VOXELS_PER_BLOCK],
+            ez: [ez; VOXELS_PER_BLOCK],
+            hx: [hx; VOXELS_PER_BLOCK],
+            hy: [hy; VOXELS_PER_BLOCK],
+            hz: [hz; VOXELS_PER_BLOCK],
+        }
+    }
+
+    fn identity_coeffs() -> [MaterialCoeffs; VOXELS_PER_BLOCK] {
+        let one = FixedQ16_16::from_f32(1.0);
+        [MaterialCoeffs {
+            ca: one,
+            cb: one,
+            da: one,
+            db: one,
+        }; VOXELS_PER_BLOCK]
+    }
+
+    /// A spatially uniform field has zero curl everywhere. With `da = 1`,
+    /// the H update must leave the field completely unchanged.
+    #[test]
+    fn uniform_field_has_zero_curl_h_update() {
+        let mut center = uniform_block(1.0, 2.0, 3.0, 4.0, 5.0, 6.0);
+        let neighbor = center.clone();
+        let coeffs = identity_coeffs();
+
+        update_h_field(
+            &mut center,
+            HUpdateNeighbors {
+                plus_x: &neighbor,
+                plus_y: &neighbor,
+                plus_z: &neighbor,
+            },
+            &coeffs,
+        );
+
+        for i in 0..VOXELS_PER_BLOCK {
+            assert!((center.hx[i] - 4.0).abs() < 1e-5);
+            assert!((center.hy[i] - 5.0).abs() < 1e-5);
+            assert!((center.hz[i] - 6.0).abs() < 1e-5);
+        }
+    }
+
+    /// Mirror image of the above for the E update, with `ca = 1`.
+    #[test]
+    fn uniform_field_has_zero_curl_e_update() {
+        let mut center = uniform_block(1.0, 2.0, 3.0, 4.0, 5.0, 6.0);
+        let neighbor = center.clone();
+        let coeffs = identity_coeffs();
+
+        update_e_field(
+            &mut center,
+            EUpdateNeighbors {
+                minus_x: &neighbor,
+                minus_y: &neighbor,
+                minus_z: &neighbor,
+            },
+            &coeffs,
+        );
+
+        for i in 0..VOXELS_PER_BLOCK {
+            assert!((center.ex[i] - 1.0).abs() < 1e-5);
+            assert!((center.ey[i] - 2.0).abs() < 1e-5);
+            assert!((center.ez[i] - 3.0).abs() < 1e-5);
+        }
+    }
+
+    /// With `PmlCoeffs::IDENTITY` on all three axes and a zeroed `PmlAux`,
+    /// the PML-aware kernel's stretched-coordinate correction is defined to
+    /// be a no-op -- so it must produce the same result as the plain kernel
+    /// on the same input, to floating-point precision.
+    #[test]
+    fn pml_identity_matches_plain_kernel() {
+        let mut plain = uniform_block(1.0, 2.0, 3.0, 4.0, 5.0, 6.0);
+        let mut pml = plain.clone();
+        let neighbor = plain.clone();
+        let coeffs = identity_coeffs();
+
+        update_h_field(
+            &mut plain,
+            HUpdateNeighbors {
+                plus_x: &neighbor,
+                plus_y: &neighbor,
+                plus_z: &neighbor,
+            },
+            &coeffs,
+        );
+
+        let identity_window = [PmlCoeffs::IDENTITY; BLOCK_DIM];
+        let mut aux = PmlAux::ZERO;
+        update_h_field_pml(
+            &mut pml,
+            HUpdateNeighbors {
+                plus_x: &neighbor,
+                plus_y: &neighbor,
+                plus_z: &neighbor,
+            },
+            &coeffs,
+            &identity_window,
+            &identity_window,
+            &identity_window,
+            &mut aux,
+        );
+
+        for i in 0..VOXELS_PER_BLOCK {
+            assert!((plain.hx[i] - pml.hx[i]).abs() < 1e-6);
+            assert!((plain.hy[i] - pml.hy[i]).abs() < 1e-6);
+            assert!((plain.hz[i] - pml.hz[i]).abs() < 1e-6);
+        }
+    }
+}
