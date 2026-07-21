@@ -684,7 +684,17 @@ impl PmlContext {
 /// worker threads in `src/engine.rs`, guarantees no cache line is ever
 /// shared between two blocks owned by different threads (no false
 /// sharing).
-#[repr(align(64))]
+///
+/// `repr(C)` (in addition to the cache-line alignment) is load-bearing, not
+/// decorative: `src/engine.rs`'s `serialize_snapshot` writes this struct's
+/// raw bytes directly to `wave_trajectory.bin`, and `wavefront-view`
+/// (`src/bin/wavefront-view.rs`) parses that file back by assuming
+/// `ex, ey, ez, hx, hy, hz` appear in exactly this order. Plain `repr(Rust)`
+/// does not guarantee field order matches declaration order -- `repr(C)`
+/// does, which is what makes the on-disk format's layout well-defined
+/// rather than an accident of the current compiler's field-reordering
+/// heuristics.
+#[repr(C, align(64))]
 #[derive(Clone)]
 pub struct FieldBlock {
     pub ex: [f32; VOXELS_PER_BLOCK],

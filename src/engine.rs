@@ -37,7 +37,7 @@
 
 use crate::fdtd::{self, EUpdateNeighbors, HUpdateNeighbors};
 use crate::layout::{
-    CoeffGrid, FieldBlock, FieldGrid, MaterialCoeffs, PmlAux, PmlAuxGrid, PmlContext, BLOCK_DIM,
+    CoeffGrid, FieldBlock, FieldGrid, MaterialCoeffs, PmlAux, PmlAuxGrid, PmlContext,
     VOXELS_PER_BLOCK,
 };
 use crate::source::Source;
@@ -607,7 +607,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{GridDims, MaterialGrid, MaterialTable};
+    use crate::layout::{GridDims, MaterialGrid, MaterialTable, BLOCK_DIM};
     use crate::source::{FieldComponent, Source, Waveform};
 
     const SPEED_OF_LIGHT_M_PER_S: f32 = 299_792_458.0;

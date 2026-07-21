@@ -31,6 +31,9 @@ RAM), on a single Linux workstation.
 - Geometry: structures can be described in a small plain-text scene format
   (spheres and boxes tagged with material constants) and voxelized into the
   material grid, instead of only the hardcoded demo sphere (`src/scene.rs`).
+- Visualization: `wavefront-view`, a second binary in this crate, renders
+  one 2D slice of one snapshot as a PPM image, so a run's output can
+  actually be looked at (`src/bin/wavefront-view.rs`).
 
 ## Requirements
 
@@ -60,9 +63,16 @@ RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
     cargo +nightly build --release
 ```
 
-The resulting binary (`target/release/wavefront`) is tuned to the exact
-machine it was built on (`target-cpu=native`) — don't copy it to a
-different CPU microarchitecture; rebuild there instead.
+This produces two binaries, both tuned to the exact machine they were built
+on (`target-cpu=native`) — don't copy them to a different CPU
+microarchitecture; rebuild there instead:
+
+- `target/release/wavefront` — the simulator.
+- `target/release/wavefront-view` — the slice-to-image post-processing tool
+  (see [Visualize](#visualize)).
+
+Both share the core solver code via a library crate (`src/lib.rs`); the
+simulator binary itself is just `src/main.rs`'s CLI/orchestration layer.
 
 > **Licensing note:** the `rio` crate is GPL-3.0 by default (an MIT/Apache-2.0
 > dual license is available by sponsoring the author). Confirm this is
@@ -143,6 +153,35 @@ to 255 non-vacuum materials).
 every `FieldBlock` in the grid, in block-major (Z, then Y, then X) order,
 each block serialized as six back-to-back `f32` arrays (`Ex, Ey, Ez, Hx, Hy,
 Hz`), 512 voxels per array (8x8x8 block, row-major with X fastest-varying).
+There's no header, so any reader (like `wavefront-view`) needs to already
+know `nx`/`ny`/`nz`.
+
+## Visualize
+
+`wavefront-view` renders one 2D slice of one snapshot as a binary PPM image
+(`.ppm` -- viewable directly in GIMP, or converted with
+`magick slice.ppm slice.png`). It needs the same `--nx`/`--ny`/`--nz` the
+simulation was run with, since the trajectory file has no header:
+
+```sh
+./target/release/wavefront-view \
+    --input wave_trajectory.bin --nx 128 --ny 128 --nz 128 \
+    --snapshot 10 --axis z --component energy --output slice.ppm
+```
+
+| Flag                | Meaning                                                    | Default       |
+|---------------------|-------------------------------------------------------------|---------------|
+| `--input <PATH>`    | Trajectory file to read (required)                          |               |
+| `--nx/-ny/-nz <N>`  | Grid dimensions the run used (required)                      |               |
+| `--snapshot <N>`    | Which snapshot to render, 0-indexed                          | `0`           |
+| `--axis <x\|y\|z>`  | Which axis to hold fixed (the slice's normal)                | `z`           |
+| `--slice <N>`       | Index along `--axis` to slice at                             | middle        |
+| `--component <C>`   | `ex`, `ey`, `ez`, `hx`, `hy`, `hz`, or `energy` (sum of squares of all six) | `energy` |
+| `--output <PATH>`   | Output PPM path                                              | `slice.ppm`   |
+
+Values are normalized per-image by their own maximum magnitude and mapped
+through a white-to-red/white-to-blue diverging colormap (white-to-red only
+for `energy`, which is never negative).
 
 ## Tests
 

@@ -1,27 +1,22 @@
 //! `wavefront` -- CLI entry point, configuration parsing, and temporal loop
 //! orchestration for the out-of-core 3D FDTD electromagnetic simulator.
 //!
-//! This binary wires together the three library modules:
-//!   - `layout`: mmap'd material grid, cache-aligned AoSoA field grid.
-//!   - `fdtd`: the SIMD Yee-lattice curl update kernels.
-//!   - `engine`: spatial decomposition, rayon scheduling, crossbeam halo
-//!     exchange, and the `io_uring` snapshot writer.
+//! This binary is a thin driver over the `wavefront` library crate
+//! (`src/lib.rs`), which owns the actual `layout`/`fdtd`/`engine`/`scene`/
+//! `source` modules -- shared with the `wavefront-view` post-processing
+//! tool in `src/bin/`.
 //!
 //! Absent a `--scene` file, it falls back to a single demonstration
 //! scenario -- a dielectric sphere embedded in vacuum -- excited by a
 //! configurable point source (default: a Ricker wavelet on Ez at the
 //! domain center) re-injected every timestep.
 
-#![feature(portable_simd)]
-
-mod engine;
-mod fdtd;
-mod layout;
-mod scene;
-mod source;
-
-use layout::{CoeffGrid, FieldGrid, GridDims, MaterialGrid, MaterialId, MaterialTable, PmlConfig, PmlContext, BLOCK_DIM};
-use source::{FieldComponent, Source, Waveform};
+use wavefront::layout::{
+    CoeffGrid, FieldGrid, GridDims, MaterialGrid, MaterialId, MaterialTable, PmlConfig,
+    PmlContext, BLOCK_DIM,
+};
+use wavefront::source::{FieldComponent, Source, Waveform};
+use wavefront::{engine, scene};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -263,7 +258,7 @@ fn run(config: Config) -> Result<(), String> {
         dims.nx,
         dims.ny,
         dims.nz,
-        (dims.block_count() * std::mem::size_of::<layout::FieldBlock>()) / (1024 * 1024),
+        (dims.block_count() * std::mem::size_of::<wavefront::layout::FieldBlock>()) / (1024 * 1024),
         config.dx,
         config.dt,
         config.num_steps,
