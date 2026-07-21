@@ -36,7 +36,10 @@
 //! back around to a buffer that's still in flight.
 
 use crate::fdtd::{self, EUpdateNeighbors, HUpdateNeighbors};
-use crate::layout::{CoeffGrid, FieldBlock, FieldGrid, MaterialCoeffs, VOXELS_PER_BLOCK};
+use crate::layout::{
+    CoeffGrid, FieldBlock, FieldGrid, MaterialCoeffs, PmlAux, PmlAuxGrid, PmlContext,
+    VOXELS_PER_BLOCK,
+};
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
@@ -47,16 +50,19 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::time::Instant;
 
-/// A single all-zero block used as the "outer" boundary condition at the
-/// true edges of the domain (X/Y always, and the Z edges of the first and
-/// last slab).
+/// A single all-zero block used as the boundary condition one voxel outside
+/// the true edges of the domain (X/Y always, and the Z edges of the first
+/// and last slab).
 ///
-/// This amounts to a simple perfect-electric-conductor (zero-field)
-/// termination. A production deployment would replace this with a proper
-/// absorbing boundary (CPML) layer; that is a substantial piece of
-/// numerics on its own and out of scope here; every read site below is
-/// isolated behind this one constant, so it is a drop-in seam for that
-/// future work.
+/// This is a perfect-electric-conductor (zero-field) backing termination.
+/// With PML disabled (`PmlConfig::thickness == 0`), it's the *only*
+/// boundary condition, and it reflects outgoing energy. With PML enabled
+/// (`src/layout.rs`'s `PmlContext`/`PmlAuxGrid`), the outermost
+/// `thickness`-deep shell of blocks applies a graded absorbing correction
+/// before a wave ever reaches this backing plane, so by the time a wave
+/// *does* reach it, it has already been attenuated to whatever residual
+/// the target reflection coefficient allows -- the same "PEC-backed PML"
+/// setup used in most production FDTD codes.
 static OUTER_ZERO_BLOCK: FieldBlock = FieldBlock::ZERO;
 
 // =============================================================================
@@ -71,12 +77,22 @@ static OUTER_ZERO_BLOCK: FieldBlock = FieldBlock::ZERO;
 /// the bottom E-plane of the *next* slab up (received over a
 /// `crossbeam_channel`), used as the `+Z` neighbor for this slab's own top
 /// plane.
+///
+/// `pml` is `None` when the PML is disabled entirely; otherwise it carries
+/// the three per-axis coefficient profiles, and `pml_aux_slab` is the
+/// matching slice of `PmlAuxGrid` blocks (`Some` only inside the PML
+/// shell). `bz_offset` is this slab's starting block index along Z in the
+/// *global* grid, needed to look up the right window of the Z profile.
+#[allow(clippy::too_many_arguments)]
 fn update_slab_h(
     slab: &mut [FieldBlock],
     coeffs: &[[MaterialCoeffs; VOXELS_PER_BLOCK]],
+    pml_aux_slab: &mut [Option<Box<PmlAux>>],
+    pml: Option<&PmlContext>,
     bx_n: usize,
     by_n: usize,
     bz_n: usize,
+    bz_offset: usize,
     plus_z_halo: &[FieldBlock],
 ) {
     let plane = bx_n * by_n;
@@ -93,16 +109,17 @@ fn update_slab_h(
                 // `slab` (`bx_n * by_n * bz_n` elements total, matching
                 // `slab.len()`) -- distinct because `bx`, `by`, `bz` range
                 // over disjoint coordinates and the neighbor offsets never
-                // wrap back onto `idx` itself. `update_h_field` only ever
-                // writes `center`'s `hx`/`hy`/`hz` arrays and only ever
-                // reads `ex`/`ey`/`ez` off of `center` and its neighbors, so
-                // the exclusive borrow of `center` and the shared borrows of
-                // its neighbors never alias the same memory, even though
-                // the borrow checker cannot see that fact through the raw
-                // pointer arithmetic. Each iteration's borrows are also
-                // scoped to that iteration alone (dropped before the next
-                // `base.add(..)` dereference), so there is no overlap across
-                // iterations either.
+                // wrap back onto `idx` itself. `update_h_field`/
+                // `update_h_field_pml` only ever write `center`'s
+                // `hx`/`hy`/`hz` arrays and only ever read `ex`/`ey`/`ez` off
+                // of `center` and its neighbors, so the exclusive borrow of
+                // `center` and the shared borrows of its neighbors never
+                // alias the same memory, even though the borrow checker
+                // cannot see that fact through the raw pointer arithmetic.
+                // Each iteration's borrows are also scoped to that iteration
+                // alone (dropped before the next `base.add(..)`
+                // dereference), so there is no overlap across iterations
+                // either.
                 let center: &mut FieldBlock = unsafe { &mut *base.add(idx) };
 
                 let plus_x: &FieldBlock = if bx + 1 < bx_n {
@@ -121,15 +138,23 @@ fn update_slab_h(
                     &plus_z_halo[by * bx_n + bx]
                 };
 
-                fdtd::update_h_field(
-                    center,
-                    HUpdateNeighbors {
-                        plus_x,
-                        plus_y,
-                        plus_z,
-                    },
-                    &coeffs[idx],
-                );
+                let nbrs = HUpdateNeighbors {
+                    plus_x,
+                    plus_y,
+                    plus_z,
+                };
+
+                match (pml, pml_aux_slab[idx].as_deref_mut()) {
+                    (Some(pml), Some(aux)) => {
+                        let px = PmlContext::axis_window(&pml.profile_x, bx);
+                        let py = PmlContext::axis_window(&pml.profile_y, by);
+                        let pz = PmlContext::axis_window(&pml.profile_z, bz_offset + bz);
+                        fdtd::update_h_field_pml(center, nbrs, &coeffs[idx], &px, &py, &pz, aux);
+                    }
+                    _ => {
+                        fdtd::update_h_field(center, nbrs, &coeffs[idx]);
+                    }
+                }
             }
         }
     }
@@ -137,13 +162,18 @@ fn update_slab_h(
 
 /// Advances the E field for every block in one slab. Mirror image of
 /// [`update_slab_h`]: reads `-X`/`-Y`/`-Z` neighbors, with `minus_z_halo`
-/// the top H-plane of the *previous* slab down.
+/// the top H-plane of the *previous* slab down. See [`update_slab_h`] for
+/// the `pml`/`pml_aux_slab`/`bz_offset` parameters.
+#[allow(clippy::too_many_arguments)]
 fn update_slab_e(
     slab: &mut [FieldBlock],
     coeffs: &[[MaterialCoeffs; VOXELS_PER_BLOCK]],
+    pml_aux_slab: &mut [Option<Box<PmlAux>>],
+    pml: Option<&PmlContext>,
     bx_n: usize,
     by_n: usize,
     bz_n: usize,
+    bz_offset: usize,
     minus_z_halo: &[FieldBlock],
 ) {
     let plane = bx_n * by_n;
@@ -155,11 +185,11 @@ fn update_slab_e(
                 let idx = (bz * by_n + by) * bx_n + bx;
 
                 // SAFETY: identical reasoning to `update_slab_h` -- distinct,
-                // in-bounds indices, and `update_e_field` writes only
-                // `center`'s `ex`/`ey`/`ez` while reading only `hx`/`hy`/`hz`
-                // off of `center` and its neighbors, so the exclusive and
-                // shared borrows taken here never alias the same field
-                // arrays.
+                // in-bounds indices, and `update_e_field`/`update_e_field_pml`
+                // write only `center`'s `ex`/`ey`/`ez` while reading only
+                // `hx`/`hy`/`hz` off of `center` and its neighbors, so the
+                // exclusive and shared borrows taken here never alias the
+                // same field arrays.
                 let center: &mut FieldBlock = unsafe { &mut *base.add(idx) };
 
                 let minus_x: &FieldBlock = if bx > 0 {
@@ -178,15 +208,23 @@ fn update_slab_e(
                     &minus_z_halo[by * bx_n + bx]
                 };
 
-                fdtd::update_e_field(
-                    center,
-                    EUpdateNeighbors {
-                        minus_x,
-                        minus_y,
-                        minus_z,
-                    },
-                    &coeffs[idx],
-                );
+                let nbrs = EUpdateNeighbors {
+                    minus_x,
+                    minus_y,
+                    minus_z,
+                };
+
+                match (pml, pml_aux_slab[idx].as_deref_mut()) {
+                    (Some(pml), Some(aux)) => {
+                        let px = PmlContext::axis_window(&pml.profile_x, bx);
+                        let py = PmlContext::axis_window(&pml.profile_y, by);
+                        let pz = PmlContext::axis_window(&pml.profile_z, bz_offset + bz);
+                        fdtd::update_e_field_pml(center, nbrs, &coeffs[idx], &px, &py, &pz, aux);
+                    }
+                    _ => {
+                        fdtd::update_e_field(center, nbrs, &coeffs[idx]);
+                    }
+                }
             }
         }
     }
@@ -357,7 +395,19 @@ fn serialize_snapshot(grid: &FieldGrid, out: &mut [u8]) {
 /// rayon-scheduled Z-slabs with crossbeam-channel halo exchange at slab
 /// boundaries, periodically streaming a field snapshot out via `rio`
 /// double-buffered `O_DIRECT` writes.
-pub fn run(field_grid: &mut FieldGrid, coeff_grid: &CoeffGrid, config: &EngineConfig) -> io::Result<()> {
+///
+/// `pml` is `None` to disable the absorbing boundary entirely (falling back
+/// to the zero-field `OUTER_ZERO_BLOCK` termination at every domain face);
+/// otherwise `pml_aux` must have been built by the same
+/// `PmlContext::build` call (so its shell of allocated blocks matches the
+/// profiles' graded region).
+pub fn run(
+    field_grid: &mut FieldGrid,
+    coeff_grid: &CoeffGrid,
+    pml: Option<&PmlContext>,
+    pml_aux: &mut PmlAuxGrid,
+    config: &EngineConfig,
+) -> io::Result<()> {
     let dims = field_grid.dims();
     let (bx_n, by_n, bz_n_total) = dims.block_dims();
     let plane = bx_n * by_n;
@@ -423,14 +473,17 @@ pub fn run(field_grid: &mut FieldGrid, coeff_grid: &CoeffGrid, config: &EngineCo
     for step in 0..config.num_steps {
         let all_blocks = field_grid.blocks_mut();
         let all_coeffs = coeff_grid.blocks();
+        let all_pml_aux = pml_aux.blocks_mut();
 
         // ---- H update phase, fanned out across slabs by rayon ----------
         all_blocks
             .par_chunks_mut(blocks_per_slab)
             .zip(all_coeffs.par_chunks(blocks_per_slab))
+            .zip(all_pml_aux.par_chunks_mut(blocks_per_slab))
             .enumerate()
-            .for_each(|(i, (slab, slab_coeffs))| {
+            .for_each(|(i, ((slab, slab_coeffs), slab_pml_aux))| {
                 let bz_n = slab.len() / plane;
+                let bz_offset = i * rows_per_slab;
 
                 let plus_z_halo: Box<[FieldBlock]> = if i + 1 < num_slabs {
                     e_rx[i].recv().expect("adjacent slab's channel half was dropped")
@@ -438,7 +491,17 @@ pub fn run(field_grid: &mut FieldGrid, coeff_grid: &CoeffGrid, config: &EngineCo
                     vec![FieldBlock::ZERO; plane].into_boxed_slice()
                 };
 
-                update_slab_h(slab, slab_coeffs, bx_n, by_n, bz_n, &plus_z_halo);
+                update_slab_h(
+                    slab,
+                    slab_coeffs,
+                    slab_pml_aux,
+                    pml,
+                    bx_n,
+                    by_n,
+                    bz_n,
+                    bz_offset,
+                    &plus_z_halo,
+                );
 
                 if i > 0 {
                     let bottom_plane: Box<[FieldBlock]> = slab[..plane].to_vec().into_boxed_slice();
@@ -452,9 +515,11 @@ pub fn run(field_grid: &mut FieldGrid, coeff_grid: &CoeffGrid, config: &EngineCo
         all_blocks
             .par_chunks_mut(blocks_per_slab)
             .zip(all_coeffs.par_chunks(blocks_per_slab))
+            .zip(all_pml_aux.par_chunks_mut(blocks_per_slab))
             .enumerate()
-            .for_each(|(i, (slab, slab_coeffs))| {
+            .for_each(|(i, ((slab, slab_coeffs), slab_pml_aux))| {
                 let bz_n = slab.len() / plane;
+                let bz_offset = i * rows_per_slab;
 
                 let minus_z_halo: Box<[FieldBlock]> = if i > 0 {
                     h_rx[i - 1].recv().expect("adjacent slab's channel half was dropped")
@@ -462,7 +527,17 @@ pub fn run(field_grid: &mut FieldGrid, coeff_grid: &CoeffGrid, config: &EngineCo
                     vec![FieldBlock::ZERO; plane].into_boxed_slice()
                 };
 
-                update_slab_e(slab, slab_coeffs, bx_n, by_n, bz_n, &minus_z_halo);
+                update_slab_e(
+                    slab,
+                    slab_coeffs,
+                    slab_pml_aux,
+                    pml,
+                    bx_n,
+                    by_n,
+                    bz_n,
+                    bz_offset,
+                    &minus_z_halo,
+                );
 
                 if i + 1 < num_slabs {
                     let top_plane: Box<[FieldBlock]> =

@@ -17,7 +17,10 @@ mod engine;
 mod fdtd;
 mod layout;
 
-use layout::{CoeffGrid, FieldGrid, GridDims, MaterialGrid, MaterialId, MaterialTable, BLOCK_DIM};
+use layout::{
+    CoeffGrid, FieldGrid, GridDims, MaterialGrid, MaterialId, MaterialTable, PmlConfig,
+    PmlContext, BLOCK_DIM,
+};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -34,6 +37,10 @@ struct Config {
     dt: f32,
     num_steps: usize,
     snapshot_every: usize,
+    /// Absorbing boundary layer thickness, in voxels, at each of the 6
+    /// domain faces. `0` disables the PML and reverts to a zero-field
+    /// (fully reflective) boundary.
+    pml_thickness: usize,
     materials_path: PathBuf,
     output_path: PathBuf,
 }
@@ -48,6 +55,7 @@ impl Default for Config {
             dt: 1.5e-12,
             num_steps: 200,
             snapshot_every: 20,
+            pml_thickness: PmlConfig::default().thickness,
             materials_path: PathBuf::from("materials.grid"),
             output_path: PathBuf::from("wave_trajectory.bin"),
         }
@@ -66,6 +74,7 @@ fn print_usage() {
          \x20   --dt <SECONDS>         timestep [default: 1.5e-12]\n\
          \x20   --steps <N>            number of timesteps to run [default: 200]\n\
          \x20   --snapshot-every <N>   timesteps between snapshot writes [default: 20]\n\
+         \x20   --pml-thickness <N>    absorbing boundary depth in voxels, 0 disables it [default: 8]\n\
          \x20   --materials <PATH>     backing file for the mmap'd material grid [default: materials.grid]\n\
          \x20   --output <PATH>        Direct I/O snapshot stream path [default: wave_trajectory.bin]\n\
          \x20   -h, --help             print this message"
@@ -99,6 +108,9 @@ fn parse_args() -> Result<Config, String> {
             "--steps" => config.num_steps = parse_num("--steps", next_value("--steps")?)?,
             "--snapshot-every" => {
                 config.snapshot_every = parse_num("--snapshot-every", next_value("--snapshot-every")?)?
+            }
+            "--pml-thickness" => {
+                config.pml_thickness = parse_num("--pml-thickness", next_value("--pml-thickness")?)?
             }
             "--materials" => config.materials_path = PathBuf::from(next_value("--materials")?),
             "--output" => config.output_path = PathBuf::from(next_value("--output")?),
@@ -182,14 +194,16 @@ fn run(config: Config) -> Result<(), String> {
     let dims = GridDims::new(config.nx, config.ny, config.nz);
 
     eprintln!(
-        "wavefront: {}x{}x{} voxels ({} MiB field state, dx={:.3e} m, dt={:.3e} s, {} steps)",
+        "wavefront: {}x{}x{} voxels ({} MiB field state, dx={:.3e} m, dt={:.3e} s, {} steps, \
+         pml={} voxels)",
         dims.nx,
         dims.ny,
         dims.nz,
         (dims.block_count() * std::mem::size_of::<layout::FieldBlock>()) / (1024 * 1024),
         config.dx,
         config.dt,
-        config.num_steps
+        config.num_steps,
+        config.pml_thickness
     );
 
     let mut material_grid = MaterialGrid::create(&config.materials_path, dims)
@@ -207,14 +221,27 @@ fn run(config: Config) -> Result<(), String> {
     let mut field_grid = FieldGrid::zeroed(dims);
     inject_initial_pulse(&mut field_grid, dims);
 
+    let pml_config = PmlConfig {
+        thickness: config.pml_thickness,
+        ..PmlConfig::default()
+    };
+    let (pml_context, mut pml_aux_grid) = PmlContext::build(dims, &pml_config, config.dt, config.dx);
+    let pml_context_ref = (config.pml_thickness > 0).then_some(&pml_context);
+
     let engine_config = engine::EngineConfig {
         num_steps: config.num_steps,
         snapshot_every: config.snapshot_every.max(1),
         output_path: config.output_path,
     };
 
-    engine::run(&mut field_grid, &coeff_grid, &engine_config)
-        .map_err(|e| format!("simulation run failed: {e}"))
+    engine::run(
+        &mut field_grid,
+        &coeff_grid,
+        pml_context_ref,
+        &mut pml_aux_grid,
+        &engine_config,
+    )
+    .map_err(|e| format!("simulation run failed: {e}"))
 }
 
 fn main() -> ExitCode {

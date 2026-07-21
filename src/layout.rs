@@ -25,6 +25,11 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 
+/// Vacuum permittivity, F/m.
+const EPS0: f32 = 8.854_187_8e-12;
+/// Vacuum permeability, H/m.
+const MU0: f32 = 1.256_637_1e-6;
+
 // =============================================================================
 // GRID DIMENSIONS
 // =============================================================================
@@ -187,8 +192,6 @@ impl MaterialTable {
     }
 
     fn coeffs_from_physical(eps_r: f32, mu_r: f32, sigma: f32, dt: f32, d: f32) -> MaterialCoeffs {
-        const EPS0: f32 = 8.854_187_8e-12;
-        const MU0: f32 = 1.256_637_1e-6;
         let eps = eps_r * EPS0;
         let mu = mu_r * MU0;
         let loss = sigma * dt / (2.0 * eps);
@@ -357,6 +360,313 @@ impl MaterialGrid {
     /// Flushes dirty pages back to disk (e.g. after voxelizing a structure).
     pub fn flush(&self) -> io::Result<()> {
         self.mmap.flush()
+    }
+}
+
+// =============================================================================
+// CPML ABSORBING BOUNDARY
+// =============================================================================
+//
+// A domain edge that just terminates the grid (zero field just outside it,
+// as `src/engine.rs`'s `OUTER_ZERO_BLOCK` does) reflects nearly all outgoing
+// energy straight back into the simulation, which is wrong for any open-
+// space problem. Wavefront implements a Convolutional PML (CPML, Roden &
+// Gedney 2000): a graded, lossy region near each domain edge that absorbs
+// outgoing waves with a controllable, very small reflection coefficient,
+// without splitting the field components (unlike the original Berenger
+// PML).
+//
+// CPML works by replacing the ordinary spatial derivative in the curl
+// update with a "stretched-coordinate" version:
+//
+//   d/du  ->  (1/kappa_u) * d/du + psi_u
+//
+// where `psi_u` is an auxiliary memory variable updated by a one-tap
+// recursive convolution each timestep:
+//
+//   psi_u_new = b_u * psi_u_old + a_u * (raw derivative)
+//
+// `kappa_u`, `b_u`, and `a_u` are derived once, at setup, from a graded
+// conductivity profile `sigma_u(rho)` (`rho` = normalized depth into the
+// layer) via the standard formulas in Taflove & Hagness ch. 7. Everywhere
+// outside the PML layer, `kappa=1, b=1, a=0`, which makes the stretched
+// derivative and the psi update both exact no-ops -- so a PML-aware kernel
+// call over a fully-interior block is mathematically identical to the
+// plain kernel, just with a bit of wasted arithmetic. `src/engine.rs`
+// exploits this by only ever paying for PML-aware dispatch on the thin
+// shell of boundary blocks, keeping the O(surface-area) `PmlAux` memory
+// cost far below the O(volume) cost of the field grid itself.
+
+/// Tunable parameters for the CPML layer. See Taflove & Hagness,
+/// *Computational Electrodynamics*, ch. 7, for the standard ranges these
+/// come from.
+#[derive(Debug, Clone, Copy)]
+pub struct PmlConfig {
+    /// Thickness of the absorbing layer, in voxels, at each of the 6 domain
+    /// faces. Rounded up to a whole number of [`BLOCK_DIM`]-sized block
+    /// layers (PML bookkeeping is allocated per-block, not per-voxel).
+    /// `0` disables the PML entirely, reverting to a zero-field boundary.
+    pub thickness: usize,
+    /// Polynomial grading order `m` for `sigma` and `kappa` (typical 3-4).
+    pub grading_order: f32,
+    /// Maximum coordinate-stretching factor `kappa_max` (typical 5-15;
+    /// `1.0` disables stretching and leaves only the conductive loss).
+    pub kappa_max: f32,
+    /// Maximum CFS-PML relaxation parameter `alpha_max`, which improves
+    /// absorption of near-grazing and low-frequency waves (typical
+    /// 0.05-0.24).
+    pub alpha_max: f32,
+    /// Target normal-incidence reflection coefficient `R0` used to derive
+    /// `sigma_max` (typical 1e-6 to 1e-8; smaller is a "better" but not
+    /// necessarily more stable PML).
+    pub target_reflection: f32,
+}
+
+impl Default for PmlConfig {
+    fn default() -> Self {
+        Self {
+            thickness: BLOCK_DIM,
+            grading_order: 3.0,
+            kappa_max: 7.0,
+            alpha_max: 0.05,
+            target_reflection: 1.0e-6,
+        }
+    }
+}
+
+/// The precomputed CPML recursive-convolution coefficients for one voxel
+/// position along one axis.
+#[derive(Debug, Clone, Copy)]
+pub struct PmlCoeffs {
+    pub b: f32,
+    pub a: f32,
+    pub inv_kappa: f32,
+}
+
+impl PmlCoeffs {
+    /// The no-op coefficient set: `1/kappa = 1`, `b = 1`, `a = 0`. Applying
+    /// a PML correction with these coefficients leaves the derivative and
+    /// the psi memory unchanged -- this is what every non-PML voxel uses.
+    pub const IDENTITY: PmlCoeffs = PmlCoeffs {
+        b: 1.0,
+        a: 0.0,
+        inv_kappa: 1.0,
+    };
+}
+
+/// A full-axis-length array of [`PmlCoeffs`], graded near both ends of the
+/// axis and [`PmlCoeffs::IDENTITY`] everywhere in the interior.
+///
+/// This is cheap regardless of grid size (a handful of floats per voxel
+/// *position*, not per voxel volume) and is built once at setup.
+pub struct PmlProfile1D {
+    coeffs: Box<[PmlCoeffs]>,
+}
+
+impl PmlProfile1D {
+    /// Builds the graded profile for an axis of length `n`, with a
+    /// `thickness_voxels`-deep absorbing layer at each end (already
+    /// clamped/rounded by the caller -- see
+    /// [`effective_pml_thickness_blocks`]).
+    pub fn build(n: usize, config: &PmlConfig, dt: f32, dx: f32, thickness_voxels: usize) -> Self {
+        let mut coeffs = vec![PmlCoeffs::IDENTITY; n].into_boxed_slice();
+        if thickness_voxels == 0 {
+            return Self { coeffs };
+        }
+
+        let thickness = thickness_voxels;
+        let pml_depth_m = thickness as f32 * dx;
+        let eta0 = (MU0 / EPS0).sqrt();
+        let sigma_max = -(config.grading_order + 1.0) * config.target_reflection.ln()
+            / (2.0 * eta0 * pml_depth_m);
+
+        for g in 0..thickness {
+            // rho = 1 at the true domain edge (g == 0), grading down to
+            // ~1/thickness at the innermost PML cell, adjacent to the
+            // ordinary interior.
+            let rho = (thickness - g) as f32 / thickness as f32;
+            let sigma = sigma_max * rho.powf(config.grading_order);
+            let kappa = 1.0 + (config.kappa_max - 1.0) * rho.powf(config.grading_order);
+            let alpha = config.alpha_max * (1.0 - rho);
+            let c = Self::coeffs_from_physical(sigma, kappa, alpha, dt);
+
+            coeffs[g] = c; // low-side face, g == 0 is the true edge
+            coeffs[n - 1 - g] = c; // high-side face, mirrored
+        }
+
+        Self { coeffs }
+    }
+
+    fn coeffs_from_physical(sigma: f32, kappa: f32, alpha: f32, dt: f32) -> PmlCoeffs {
+        let b = (-(sigma / kappa + alpha) * dt / EPS0).exp();
+        let denom = kappa * (sigma + kappa * alpha);
+        let a = if denom.abs() > 1.0e-30 {
+            sigma * (b - 1.0) / denom
+        } else {
+            0.0
+        };
+        PmlCoeffs {
+            b,
+            a,
+            inv_kappa: 1.0 / kappa,
+        }
+    }
+
+    #[inline(always)]
+    pub fn get(&self, i: usize) -> PmlCoeffs {
+        self.coeffs[i]
+    }
+}
+
+/// Clamps a requested PML thickness (in voxels) to a whole number of
+/// [`BLOCK_DIM`]-sized block layers that fits within half of the shortest
+/// axis (so the low- and high-side layers of any axis can never overlap).
+/// `0` in, `0` out -- PML stays disabled if the caller asked for that.
+pub fn effective_pml_thickness_blocks(dims: GridDims, requested_thickness_voxels: usize) -> usize {
+    if requested_thickness_voxels == 0 {
+        return 0;
+    }
+    let (bx_n, by_n, bz_n) = dims.block_dims();
+    let requested_blocks = requested_thickness_voxels.div_ceil(BLOCK_DIM).max(1);
+    let max_blocks = (bx_n.min(by_n).min(bz_n) / 2).max(1);
+    requested_blocks.min(max_blocks)
+}
+
+/// Per-block CPML auxiliary ("psi") convolution memory: one persistent
+/// value per voxel, per raw derivative term that needs stretched-coordinate
+/// correction. Only ever allocated for blocks inside the PML shell (see
+/// [`PmlAuxGrid`]) -- everywhere else, the correction is a no-op and no
+/// memory is spent on it.
+///
+/// Field naming is `psi_<source>_d<axis>`: e.g. `psi_ez_dx` is the psi
+/// memory for the `dEz/dx` term (which feeds the Hy update).
+#[repr(align(64))]
+#[derive(Clone)]
+pub struct PmlAux {
+    pub psi_ez_dx: [f32; VOXELS_PER_BLOCK],
+    pub psi_ey_dx: [f32; VOXELS_PER_BLOCK],
+    pub psi_ez_dy: [f32; VOXELS_PER_BLOCK],
+    pub psi_ex_dy: [f32; VOXELS_PER_BLOCK],
+    pub psi_ey_dz: [f32; VOXELS_PER_BLOCK],
+    pub psi_ex_dz: [f32; VOXELS_PER_BLOCK],
+    pub psi_hz_dx: [f32; VOXELS_PER_BLOCK],
+    pub psi_hy_dx: [f32; VOXELS_PER_BLOCK],
+    pub psi_hx_dy: [f32; VOXELS_PER_BLOCK],
+    pub psi_hz_dy: [f32; VOXELS_PER_BLOCK],
+    pub psi_hy_dz: [f32; VOXELS_PER_BLOCK],
+    pub psi_hx_dz: [f32; VOXELS_PER_BLOCK],
+}
+
+impl PmlAux {
+    pub const ZERO: PmlAux = PmlAux {
+        psi_ez_dx: [0.0; VOXELS_PER_BLOCK],
+        psi_ey_dx: [0.0; VOXELS_PER_BLOCK],
+        psi_ez_dy: [0.0; VOXELS_PER_BLOCK],
+        psi_ex_dy: [0.0; VOXELS_PER_BLOCK],
+        psi_ey_dz: [0.0; VOXELS_PER_BLOCK],
+        psi_ex_dz: [0.0; VOXELS_PER_BLOCK],
+        psi_hz_dx: [0.0; VOXELS_PER_BLOCK],
+        psi_hy_dx: [0.0; VOXELS_PER_BLOCK],
+        psi_hx_dy: [0.0; VOXELS_PER_BLOCK],
+        psi_hz_dy: [0.0; VOXELS_PER_BLOCK],
+        psi_hy_dz: [0.0; VOXELS_PER_BLOCK],
+        psi_hx_dz: [0.0; VOXELS_PER_BLOCK],
+    };
+}
+
+/// The sparse, block-major companion to [`FieldGrid`] holding [`PmlAux`]
+/// memory only for blocks inside the PML shell (`Some`); every interior
+/// block is `None` and costs only one pointer-sized slot.
+///
+/// Because it mirrors `FieldGrid`'s block-major layout exactly, it can be
+/// sliced into the same per-thread Z-slabs `src/engine.rs` already uses for
+/// `FieldGrid` and `CoeffGrid`, with no extra decomposition logic.
+pub struct PmlAuxGrid {
+    blocks: Box<[Option<Box<PmlAux>>]>,
+    dims: GridDims,
+}
+
+impl PmlAuxGrid {
+    /// `thickness_voxels` should be the same (already-clamped) value passed
+    /// to each axis's [`PmlProfile1D::build`], so the shell of allocated
+    /// blocks lines up exactly with the region where the profiles carry
+    /// non-identity coefficients.
+    pub fn build(dims: GridDims, thickness_voxels: usize) -> Self {
+        let (bx_n, by_n, bz_n) = dims.block_dims();
+        let thickness_blocks = thickness_voxels / BLOCK_DIM;
+
+        let mut blocks = Vec::with_capacity(bx_n * by_n * bz_n);
+        for bz in 0..bz_n {
+            for by in 0..by_n {
+                for bx in 0..bx_n {
+                    let in_shell = thickness_blocks > 0
+                        && (bx < thickness_blocks
+                            || bx >= bx_n - thickness_blocks
+                            || by < thickness_blocks
+                            || by >= by_n - thickness_blocks
+                            || bz < thickness_blocks
+                            || bz >= bz_n - thickness_blocks);
+                    blocks.push(in_shell.then(|| Box::new(PmlAux::ZERO)));
+                }
+            }
+        }
+
+        Self {
+            blocks: blocks.into_boxed_slice(),
+            dims,
+        }
+    }
+
+    pub fn dims(&self) -> GridDims {
+        self.dims
+    }
+
+    pub fn blocks_mut(&mut self) -> &mut [Option<Box<PmlAux>>] {
+        &mut self.blocks
+    }
+}
+
+/// The three per-axis graded profiles that drive the CPML correction,
+/// bundled together with the constructor that builds them (and the
+/// matching [`PmlAuxGrid`]) consistently from one [`PmlConfig`].
+pub struct PmlContext {
+    pub profile_x: PmlProfile1D,
+    pub profile_y: PmlProfile1D,
+    pub profile_z: PmlProfile1D,
+}
+
+impl PmlContext {
+    pub fn build(dims: GridDims, config: &PmlConfig, dt: f32, dx: f32) -> (Self, PmlAuxGrid) {
+        let thickness_blocks = effective_pml_thickness_blocks(dims, config.thickness);
+        let thickness_voxels = thickness_blocks * BLOCK_DIM;
+
+        let profile_x = PmlProfile1D::build(dims.nx, config, dt, dx, thickness_voxels);
+        let profile_y = PmlProfile1D::build(dims.ny, config, dt, dx, thickness_voxels);
+        let profile_z = PmlProfile1D::build(dims.nz, config, dt, dx, thickness_voxels);
+        let aux_grid = PmlAuxGrid::build(dims, thickness_voxels);
+
+        (
+            Self {
+                profile_x,
+                profile_y,
+                profile_z,
+            },
+            aux_grid,
+        )
+    }
+
+    /// Gathers one block's worth (`BLOCK_DIM` consecutive positions,
+    /// starting at `block_index * BLOCK_DIM`) of coefficients out of a 1D
+    /// profile -- cheap, and only ever called once per PML-shell block per
+    /// update phase (not per voxel).
+    #[inline]
+    pub fn axis_window(profile: &PmlProfile1D, block_index: usize) -> [PmlCoeffs; BLOCK_DIM] {
+        let base = block_index * BLOCK_DIM;
+        let mut out = [PmlCoeffs::IDENTITY; BLOCK_DIM];
+        for (l, o) in out.iter_mut().enumerate() {
+            *o = profile.get(base + l);
+        }
+        out
     }
 }
 

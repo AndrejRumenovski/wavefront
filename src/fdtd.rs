@@ -25,7 +25,7 @@
 //! exactly one lane from the appropriate neighbor block -- see
 //! [`shifted_row_plus`] and [`shifted_row_minus`].
 
-use crate::layout::{FieldBlock, MaterialCoeffs, BLOCK_DIM, VOXELS_PER_BLOCK};
+use crate::layout::{FieldBlock, MaterialCoeffs, PmlAux, PmlCoeffs, BLOCK_DIM, VOXELS_PER_BLOCK};
 use std::simd::f32x8;
 
 /// Builds `v` such that `v[i] == row_at_x(i + 1)` for `i in 0..BLOCK_DIM`,
@@ -85,6 +85,81 @@ fn gather_row(
 #[inline(always)]
 fn store_row(component: &mut [f32; VOXELS_PER_BLOCK], row_base: usize, v: f32x8) {
     v.copy_to_slice(&mut component[row_base..row_base + BLOCK_DIM]);
+}
+
+/// Borrows one contiguous X-row of a psi-memory component as a fixed-size
+/// array reference, for the CPML correction helpers below.
+#[inline(always)]
+fn psi_row_mut(component: &mut [f32; VOXELS_PER_BLOCK], row_base: usize) -> &mut [f32; BLOCK_DIM] {
+    (&mut component[row_base..row_base + BLOCK_DIM])
+        .try_into()
+        .unwrap()
+}
+
+// =============================================================================
+// CPML STRETCHED-COORDINATE DERIVATIVE CORRECTION
+// =============================================================================
+//
+// See `src/layout.rs`'s CPML section for the derivation. Both helpers below
+// implement the same one-tap recursive convolution:
+//
+//   psi_new = b * psi_old + a * raw_derivative
+//   corrected_derivative = raw_derivative / kappa + psi_new
+//
+// They differ only in whether `b`/`a`/`inv_kappa` are per-lane (X, the SIMD
+// axis) or a single scalar broadcast across all 8 lanes (Y/Z, since every
+// lane in a Y- or Z-derivative row shares the same Y or Z position).
+
+/// Builds the per-lane `b`, `a`, and `1/kappa` vectors for a block's X-axis
+/// window, once per kernel call (not per row) -- the X profile depends only
+/// on the block's `bx`, so it's identical for every row inside the block.
+#[inline(always)]
+fn pml_x_vectors(window: &[PmlCoeffs; BLOCK_DIM]) -> (f32x8, f32x8, f32x8) {
+    let mut b = [0.0f32; BLOCK_DIM];
+    let mut a = [0.0f32; BLOCK_DIM];
+    let mut inv_kappa = [0.0f32; BLOCK_DIM];
+    for i in 0..BLOCK_DIM {
+        b[i] = window[i].b;
+        a[i] = window[i].a;
+        inv_kappa[i] = window[i].inv_kappa;
+    }
+    (
+        f32x8::from_array(b),
+        f32x8::from_array(a),
+        f32x8::from_array(inv_kappa),
+    )
+}
+
+/// Applies the CPML correction to a raw X-direction derivative, where each
+/// of the 8 SIMD lanes has its own coefficient (one per X position).
+#[inline(always)]
+fn pml_correct_x(
+    raw: f32x8,
+    b: f32x8,
+    a: f32x8,
+    inv_kappa: f32x8,
+    psi: &mut [f32; BLOCK_DIM],
+) -> f32x8 {
+    let psi_old = f32x8::from_array(*psi);
+    let psi_new = b * psi_old + a * raw;
+    psi_new.copy_to_slice(psi);
+    raw * inv_kappa + psi_new
+}
+
+/// Applies the CPML correction to a raw Y- or Z-direction derivative, where
+/// `b`/`a`/`inv_kappa` are a single scalar shared by the whole row.
+#[inline(always)]
+fn pml_correct_scalar(
+    raw: f32x8,
+    b: f32,
+    a: f32,
+    inv_kappa: f32,
+    psi: &mut [f32; BLOCK_DIM],
+) -> f32x8 {
+    let psi_old = f32x8::from_array(*psi);
+    let psi_new = f32x8::splat(b) * psi_old + f32x8::splat(a) * raw;
+    psi_new.copy_to_slice(psi);
+    raw * f32x8::splat(inv_kappa) + psi_new
 }
 
 // =============================================================================
@@ -177,6 +252,95 @@ pub fn update_h_field(
     }
 }
 
+/// CPML-aware variant of [`update_h_field`] for blocks inside the PML
+/// shell: identical Yee update, except each raw derivative that needs
+/// stretched-coordinate correction is passed through [`pml_correct_x`] or
+/// [`pml_correct_scalar`] before it enters the curl, using `aux`'s psi
+/// memory for that term and the per-axis coefficient windows in
+/// `pml_x`/`pml_y`/`pml_z`.
+///
+/// `pml_x`/`pml_y`/`pml_z` are this block's `BLOCK_DIM`-wide coefficient
+/// windows (one [`PmlCoeffs`] per local voxel position along that axis),
+/// built once per call by `src/engine.rs` via
+/// `PmlContext::axis_window`. Passing [`PmlCoeffs::IDENTITY`] for an axis
+/// that isn't part of this block's PML shell makes that axis's correction
+/// an exact no-op, which is how corner/edge blocks touching more than one
+/// face are handled without any special-casing here.
+#[allow(clippy::too_many_arguments)]
+pub fn update_h_field_pml(
+    center: &mut FieldBlock,
+    nbrs: HUpdateNeighbors,
+    coeffs: &[MaterialCoeffs; VOXELS_PER_BLOCK],
+    pml_x: &[PmlCoeffs; BLOCK_DIM],
+    pml_y: &[PmlCoeffs; BLOCK_DIM],
+    pml_z: &[PmlCoeffs; BLOCK_DIM],
+    aux: &mut PmlAux,
+) {
+    let (px_b, px_a, px_inv_kappa) = pml_x_vectors(pml_x);
+
+    for lz in 0..BLOCK_DIM {
+        let pz = pml_z[lz];
+        for ly in 0..BLOCK_DIM {
+            let py = pml_y[ly];
+            let row_base = FieldBlock::local_index(0, ly, lz);
+
+            let ex = load_row(&center.ex, row_base);
+            let ey = load_row(&center.ey, row_base);
+            let ez = load_row(&center.ez, row_base);
+
+            let (ez_py, ex_py) = if ly + 1 < BLOCK_DIM {
+                let b = FieldBlock::local_index(0, ly + 1, lz);
+                (load_row(&center.ez, b), load_row(&center.ex, b))
+            } else {
+                let b = FieldBlock::local_index(0, 0, lz);
+                (load_row(&nbrs.plus_y.ez, b), load_row(&nbrs.plus_y.ex, b))
+            };
+
+            let (ey_pz, ex_pz) = if lz + 1 < BLOCK_DIM {
+                let b = FieldBlock::local_index(0, ly, lz + 1);
+                (load_row(&center.ey, b), load_row(&center.ex, b))
+            } else {
+                let b = FieldBlock::local_index(0, ly, 0);
+                (load_row(&nbrs.plus_z.ey, b), load_row(&nbrs.plus_z.ex, b))
+            };
+
+            let ez_row: [f32; BLOCK_DIM] = center.ez[row_base..row_base + BLOCK_DIM]
+                .try_into()
+                .unwrap();
+            let ey_row: [f32; BLOCK_DIM] = center.ey[row_base..row_base + BLOCK_DIM]
+                .try_into()
+                .unwrap();
+            let plus_x_row_base = FieldBlock::local_index(0, ly, lz);
+            let ez_px = shifted_row_plus(&ez_row, nbrs.plus_x.ez[plus_x_row_base]);
+            let ey_px = shifted_row_plus(&ey_row, nbrs.plus_x.ey[plus_x_row_base]);
+
+            // ---- raw derivatives, each CPML-corrected in place ----------
+            let d_ez_dy = pml_correct_scalar(ez_py - ez, py.b, py.a, py.inv_kappa, psi_row_mut(&mut aux.psi_ez_dy, row_base));
+            let d_ex_dy = pml_correct_scalar(ex_py - ex, py.b, py.a, py.inv_kappa, psi_row_mut(&mut aux.psi_ex_dy, row_base));
+            let d_ey_dz = pml_correct_scalar(ey_pz - ey, pz.b, pz.a, pz.inv_kappa, psi_row_mut(&mut aux.psi_ey_dz, row_base));
+            let d_ex_dz = pml_correct_scalar(ex_pz - ex, pz.b, pz.a, pz.inv_kappa, psi_row_mut(&mut aux.psi_ex_dz, row_base));
+            let d_ez_dx = pml_correct_x(ez_px - ez, px_b, px_a, px_inv_kappa, psi_row_mut(&mut aux.psi_ez_dx, row_base));
+            let d_ey_dx = pml_correct_x(ey_px - ey, px_b, px_a, px_inv_kappa, psi_row_mut(&mut aux.psi_ey_dx, row_base));
+
+            // ---- curls ---------------------------------------------------
+            let curl_hx = d_ez_dy - d_ey_dz;
+            let curl_hy = d_ex_dz - d_ez_dx;
+            let curl_hz = d_ey_dx - d_ex_dy;
+
+            let da = gather_row(coeffs, row_base, |c| c.da.to_f32());
+            let db = gather_row(coeffs, row_base, |c| c.db.to_f32());
+
+            let hx = load_row(&center.hx, row_base);
+            let hy = load_row(&center.hy, row_base);
+            let hz = load_row(&center.hz, row_base);
+
+            store_row(&mut center.hx, row_base, da * hx - db * curl_hx);
+            store_row(&mut center.hy, row_base, da * hy - db * curl_hy);
+            store_row(&mut center.hz, row_base, da * hz - db * curl_hz);
+        }
+    }
+}
+
 // =============================================================================
 // E-FIELD UPDATE
 // =============================================================================
@@ -245,6 +409,86 @@ pub fn update_e_field(
             let curl_ex = (hz - hz_my) - (hy - hy_mz); // dHz/dy - dHy/dz
             let curl_ey = (hx - hx_mz) - (hz - hz_mx); // dHx/dz - dHz/dx
             let curl_ez = (hy - hy_mx) - (hx - hx_my); // dHy/dx - dHx/dy
+
+            let ca = gather_row(coeffs, row_base, |c| c.ca.to_f32());
+            let cb = gather_row(coeffs, row_base, |c| c.cb.to_f32());
+
+            let ex = load_row(&center.ex, row_base);
+            let ey = load_row(&center.ey, row_base);
+            let ez = load_row(&center.ez, row_base);
+
+            store_row(&mut center.ex, row_base, ca * ex + cb * curl_ex);
+            store_row(&mut center.ey, row_base, ca * ey + cb * curl_ey);
+            store_row(&mut center.ez, row_base, ca * ez + cb * curl_ez);
+        }
+    }
+}
+
+/// CPML-aware variant of [`update_e_field`], mirroring
+/// [`update_h_field_pml`]: each raw H-derivative that needs
+/// stretched-coordinate correction runs through [`pml_correct_x`] /
+/// [`pml_correct_scalar`] using `aux`'s psi memory before entering the
+/// curl.
+#[allow(clippy::too_many_arguments)]
+pub fn update_e_field_pml(
+    center: &mut FieldBlock,
+    nbrs: EUpdateNeighbors,
+    coeffs: &[MaterialCoeffs; VOXELS_PER_BLOCK],
+    pml_x: &[PmlCoeffs; BLOCK_DIM],
+    pml_y: &[PmlCoeffs; BLOCK_DIM],
+    pml_z: &[PmlCoeffs; BLOCK_DIM],
+    aux: &mut PmlAux,
+) {
+    let (px_b, px_a, px_inv_kappa) = pml_x_vectors(pml_x);
+
+    for lz in 0..BLOCK_DIM {
+        let pz = pml_z[lz];
+        for ly in 0..BLOCK_DIM {
+            let py = pml_y[ly];
+            let row_base = FieldBlock::local_index(0, ly, lz);
+
+            let hx = load_row(&center.hx, row_base);
+            let hy = load_row(&center.hy, row_base);
+            let hz = load_row(&center.hz, row_base);
+
+            let (hz_my, hx_my) = if ly > 0 {
+                let b = FieldBlock::local_index(0, ly - 1, lz);
+                (load_row(&center.hz, b), load_row(&center.hx, b))
+            } else {
+                let b = FieldBlock::local_index(0, BLOCK_DIM - 1, lz);
+                (load_row(&nbrs.minus_y.hz, b), load_row(&nbrs.minus_y.hx, b))
+            };
+
+            let (hy_mz, hx_mz) = if lz > 0 {
+                let b = FieldBlock::local_index(0, ly, lz - 1);
+                (load_row(&center.hy, b), load_row(&center.hx, b))
+            } else {
+                let b = FieldBlock::local_index(0, ly, BLOCK_DIM - 1);
+                (load_row(&nbrs.minus_z.hy, b), load_row(&nbrs.minus_z.hx, b))
+            };
+
+            let hz_row: [f32; BLOCK_DIM] = center.hz[row_base..row_base + BLOCK_DIM]
+                .try_into()
+                .unwrap();
+            let hy_row: [f32; BLOCK_DIM] = center.hy[row_base..row_base + BLOCK_DIM]
+                .try_into()
+                .unwrap();
+            let minus_x_row_base = FieldBlock::local_index(BLOCK_DIM - 1, ly, lz);
+            let hz_mx = shifted_row_minus(&hz_row, nbrs.minus_x.hz[minus_x_row_base]);
+            let hy_mx = shifted_row_minus(&hy_row, nbrs.minus_x.hy[minus_x_row_base]);
+
+            // ---- raw derivatives, each CPML-corrected in place ----------
+            let d_hz_dy = pml_correct_scalar(hz - hz_my, py.b, py.a, py.inv_kappa, psi_row_mut(&mut aux.psi_hz_dy, row_base));
+            let d_hx_dy = pml_correct_scalar(hx - hx_my, py.b, py.a, py.inv_kappa, psi_row_mut(&mut aux.psi_hx_dy, row_base));
+            let d_hy_dz = pml_correct_scalar(hy - hy_mz, pz.b, pz.a, pz.inv_kappa, psi_row_mut(&mut aux.psi_hy_dz, row_base));
+            let d_hx_dz = pml_correct_scalar(hx - hx_mz, pz.b, pz.a, pz.inv_kappa, psi_row_mut(&mut aux.psi_hx_dz, row_base));
+            let d_hz_dx = pml_correct_x(hz - hz_mx, px_b, px_a, px_inv_kappa, psi_row_mut(&mut aux.psi_hz_dx, row_base));
+            let d_hy_dx = pml_correct_x(hy - hy_mx, px_b, px_a, px_inv_kappa, psi_row_mut(&mut aux.psi_hy_dx, row_base));
+
+            // ---- curls ---------------------------------------------------
+            let curl_ex = d_hz_dy - d_hy_dz;
+            let curl_ey = d_hx_dz - d_hz_dx;
+            let curl_ez = d_hy_dx - d_hx_dy;
 
             let ca = gather_row(coeffs, row_base, |c| c.ca.to_f32());
             let cb = gather_row(coeffs, row_base, |c| c.cb.to_f32());

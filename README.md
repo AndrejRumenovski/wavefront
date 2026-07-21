@@ -15,6 +15,12 @@ RAM), on a single Linux workstation.
 - Scheduling: the grid is decomposed into Z-slabs and fanned out across
   `rayon`'s work-stealing thread pool, with `crossbeam-channel` used for
   lock-free halo exchange across slab boundaries (`src/engine.rs`).
+- Boundaries: a graded Convolutional PML (CPML) absorbs outgoing waves at
+  each of the 6 domain faces, so the domain behaves like open space instead
+  of a sealed reflective box. Its auxiliary convolution memory is only
+  allocated for the thin shell of boundary blocks, not the whole volume
+  (`src/layout.rs`'s `PmlContext`/`PmlAuxGrid`, dispatched per-block in
+  `src/engine.rs`).
 - I/O: field snapshots are streamed out via double-buffered, `O_DIRECT`
   `io_uring` writes (through the `rio` crate), so storage latency never
   stalls the timestep loop (`src/engine.rs`).
@@ -81,6 +87,7 @@ t=0, and lets the solver propagate it.
 | `--dt`                  | Timestep, in seconds (must satisfy the Courant limit for `dx`) | `1.5e-12`   |
 | `--steps`               | Number of timesteps to run                            | `200`                |
 | `--snapshot-every`      | Timesteps between snapshot writes                     | `20`                 |
+| `--pml-thickness <N>`  | Absorbing boundary depth, in voxels, at each domain face. `0` disables it (fully reflective boundary) | `8` |
 | `--materials <PATH>`    | Backing file for the mmap'd material grid             | `materials.grid`     |
 | `--output <PATH>`       | Direct I/O snapshot stream path                       | `wave_trajectory.bin`|
 | `-h`, `--help`          | Print usage                                           |                      |
