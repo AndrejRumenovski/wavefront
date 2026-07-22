@@ -328,14 +328,48 @@ impl RawIoVec {
     /// or mutably accessed for as long as this `RawIoVec` -- or any
     /// `rio::Completion` built from a reference to it -- may still be
     /// reachable. `run` upholds this by only ever taking `&mut` access to a
-    /// buffer slot immediately after `.wait()`-ing the previous `Completion`
-    /// for that same slot to completion.
+    /// buffer slot immediately after `.wait()`-ing every `Completion` for
+    /// that same slot to completion.
     unsafe fn from_buffer(buf: &AlignedBuffer) -> Self {
         let bytes = buf.as_ref();
         Self {
             ptr: bytes.as_ptr(),
             len: bytes.len(),
         }
+    }
+
+    /// Splits `buf`'s bytes into consecutive [`RawIoVec`] sub-views of at
+    /// most `max_chunk_bytes` each (the last one may be shorter) -- see
+    /// [`MAX_DIRECT_IO_WRITE_BYTES`] on why a snapshot write must never be
+    /// submitted to `io_uring` as one single-shot request above a certain
+    /// size. Every resulting view's length stays a multiple of
+    /// `DIRECT_IO_ALIGN`, since both `buf`'s total length (via
+    /// `AlignedBuffer::new`'s rounding) and `max_chunk_bytes` are.
+    ///
+    /// # Safety
+    /// Identical obligation to [`RawIoVec::from_buffer`], for the lifetime of
+    /// every element of the returned `Vec`.
+    unsafe fn chunks_of(buf: &AlignedBuffer, max_chunk_bytes: usize) -> Vec<RawIoVec> {
+        let whole = Self::from_buffer(buf);
+        let mut out = Vec::with_capacity(whole.len.div_ceil(max_chunk_bytes).max(1));
+        let mut start = 0;
+        while start < whole.len {
+            let len = max_chunk_bytes.min(whole.len - start);
+            // `whole.ptr..whole.ptr + whole.len` is the full valid range
+            // established by `from_buffer` above (same call, same caller
+            // obligation), and `start + len <= whole.len` by construction
+            // (`len` is clamped to the remaining distance to `whole.len`),
+            // so `whole.ptr.add(start)` stays in-bounds (or
+            // one-past-the-end only when `len == 0`, which the loop
+            // condition `start < whole.len` never allows here). No separate
+            // `unsafe {}` needed -- this whole function is already `unsafe`.
+            out.push(RawIoVec {
+                ptr: whole.ptr.add(start),
+                len,
+            });
+            start += len;
+        }
+        out
     }
 }
 
@@ -356,6 +390,26 @@ impl AsRef<[u8]> for RawIoVec {
 /// from the `libc` crate to avoid an otherwise-unneeded dependency for one
 /// constant.
 const O_DIRECT: i32 = 0o40000;
+
+/// The largest number of bytes a single Linux `write()`/`pwrite()`-family
+/// syscall will actually transfer, no matter how large a buffer is handed to
+/// it: the kernel silently caps (does not error on) any single request at
+/// `MAX_RW_COUNT` (`0x7ffff000` -- `INT_MAX` rounded down to a page
+/// boundary; see `fs/read_write.c`), and `io_uring`'s `IORING_OP_WRITEV`
+/// resolves through the same VFS write path, so it is bound by the same
+/// cap. A snapshot whose serialized size exceeds this -- which happens at
+/// domain sizes well within what this project otherwise claims to support
+/// (any domain past roughly 450 voxels per axis) -- would silently lose its
+/// tail past this many bytes on a single-shot `write_at` call, corrupting
+/// `wave_trajectory.bin` with no I/O error raised anywhere: `rio`'s own
+/// `write_at` docs warn about exactly this ("Be sure to check the returned
+/// `io_uring_cqe`'s `res` field to see if a short write happened"), and nothing
+/// in this file used to. `run` now splits every snapshot into
+/// `MAX_DIRECT_IO_WRITE_BYTES`-sized chunks (see
+/// `RawIoVec::chunks_of`) and checks each chunk's completion against the
+/// byte count it actually requested. Picked well under the true kernel cap,
+/// and (like the cap itself) already a whole `DIRECT_IO_ALIGN` multiple.
+const MAX_DIRECT_IO_WRITE_BYTES: usize = 1 << 30; // 1 GiB
 
 // =============================================================================
 // ENGINE CONFIG & ORCHESTRATION
@@ -467,11 +521,46 @@ pub fn run(
     // a live reference), so each captured pointer/length stays valid for as
     // long as `run` runs. The loop below upholds `RawIoVec::from_buffer`'s
     // "wait before mutate" obligation for the pointed-to memory.
-    let iov_bufs: [RawIoVec; 2] =
-        unsafe { [RawIoVec::from_buffer(&buffers[0]), RawIoVec::from_buffer(&buffers[1])] };
-    let mut pending: [Option<rio::Completion<'_, usize>>; 2] = [None, None];
+    //
+    // Each buffer is split into `MAX_DIRECT_IO_WRITE_BYTES`-sized chunks
+    // (see that constant's docs) rather than handed to `write_at` as one
+    // single-shot request -- a single request above the kernel's per-syscall
+    // cap would silently write only its first `MAX_RW_COUNT` bytes with no
+    // error, corrupting every snapshot past that size.
+    let chunk_iovs: [Vec<RawIoVec>; 2] = unsafe {
+        [
+            RawIoVec::chunks_of(&buffers[0], MAX_DIRECT_IO_WRITE_BYTES),
+            RawIoVec::chunks_of(&buffers[1], MAX_DIRECT_IO_WRITE_BYTES),
+        ]
+    };
+    let mut pending: [Vec<rio::Completion<'_, usize>>; 2] = [Vec::new(), Vec::new()];
     let mut active_buffer = 0usize;
     let mut write_offset: u64 = 0;
+
+    /// Waits on every completion for one buffer slot's in-flight writes,
+    /// verifying each chunk actually transferred every byte it was asked
+    /// to -- a short write here means silent, undetected snapshot
+    /// corruption (see `MAX_DIRECT_IO_WRITE_BYTES`), so this turns that
+    /// into a loud `io::Error` instead.
+    fn drain_pending<'a>(
+        pending: &mut Vec<rio::Completion<'a, usize>>,
+        chunks: &[RawIoVec],
+    ) -> io::Result<()> {
+        for (completion, chunk) in pending.drain(..).zip(chunks) {
+            let written = completion.wait()?;
+            if written != chunk.len {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "short O_DIRECT write: wrote {written} of {} requested bytes -- \
+                         wave_trajectory.bin would be corrupted",
+                        chunk.len
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
 
     let started = Instant::now();
 
@@ -566,19 +655,20 @@ pub fn run(
         }
 
         if step % config.snapshot_every == 0 {
-            // Reclaim this buffer slot: wait only if the write that
-            // previously used it hasn't finished yet. With two buffers,
+            // Reclaim this buffer slot: wait only if the writes that
+            // previously used it haven't finished yet. With two buffers,
             // this is the ONLY point the timestep loop can stall on
             // storage, and only because we've cycled back to a slot still
             // in flight -- rare if the NVMe write completes faster than
             // `snapshot_every` timesteps take to compute.
-            if let Some(completion) = pending[active_buffer].take() {
-                completion.wait()?;
-            }
+            drain_pending(&mut pending[active_buffer], &chunk_iovs[active_buffer])?;
 
             serialize_snapshot(field_grid, buffers[active_buffer].as_mut_slice());
-            let completion = ring.write_at(&out_file, &iov_bufs[active_buffer], write_offset);
-            pending[active_buffer] = Some(completion);
+            let mut chunk_offset = write_offset;
+            for chunk in &chunk_iovs[active_buffer] {
+                pending[active_buffer].push(ring.write_at(&out_file, chunk, chunk_offset));
+                chunk_offset += chunk.len as u64;
+            }
 
             write_offset += snapshot_bytes as u64;
             active_buffer ^= 1; // flip to the alternate pre-allocated page
@@ -586,9 +676,8 @@ pub fn run(
     }
 
     // Drain any writes still in flight before returning.
-    for completion in pending.into_iter().flatten() {
-        completion.wait()?;
-    }
+    drain_pending(&mut pending[0], &chunk_iovs[0])?;
+    drain_pending(&mut pending[1], &chunk_iovs[1])?;
 
     let elapsed = started.elapsed();
     eprintln!(
@@ -712,6 +801,57 @@ mod tests {
             relative_error < 0.20,
             "measured arrival time {measured_time_s:e}s vs expected {expected_time_s:e}s \
              (speed of light over 20 voxels) -- relative error {relative_error:.3} exceeds 20%"
+        );
+    }
+
+    /// Regression test for a real bug found running a large-scale (512^3
+    /// voxel) out-of-core validation: a snapshot whose serialized size
+    /// exceeded Linux's per-syscall `write()` cap (`MAX_RW_COUNT`,
+    /// `0x7ffff000` bytes) was silently truncated by the kernel on a
+    /// single-shot `write_at` -- corrupting `wave_trajectory.bin` with no
+    /// error raised anywhere, since the code never checked the returned
+    /// byte count against what it requested. `RawIoVec::chunks_of` is the
+    /// fix: split every write into sub-`MAX_RW_COUNT` chunks. This test
+    /// exercises its pure chunk-boundary math directly (small buffer, small
+    /// chunk size) rather than an actual multi-gigabyte `O_DIRECT` write --
+    /// consistent with this suite's existing avoidance of Direct-I/O-
+    /// dependent tests, which can be flaky in a CI sandbox that doesn't
+    /// support it (see `wave_propagates_at_approximately_speed_of_light`
+    /// above).
+    #[test]
+    fn raw_io_vec_chunks_of_covers_the_whole_buffer_with_no_gaps_or_overlap() {
+        // `AlignedBuffer::new` always rounds up to a `DIRECT_IO_ALIGN`
+        // (4096-byte) multiple, so a buffer "logically" 10000 bytes long is
+        // actually 12288 bytes (3 alignment units) -- exercise a chunk size
+        // that doesn't evenly divide that, to prove the last chunk is
+        // correctly shorter rather than out-of-bounds or panicking.
+        let mut buf = AlignedBuffer::new(10_000);
+        assert_eq!(buf.len, 12_288, "sanity: AlignedBuffer rounds up to a 4096 multiple");
+
+        // Fill with a distinct byte per position so any misplaced chunk
+        // boundary would show up as wrong data, not just a wrong length.
+        for (i, b) in buf.as_mut_slice().iter_mut().enumerate() {
+            *b = (i % 251) as u8; // 251 is prime, avoids the 256-wraparound aliasing every byte
+        }
+
+        let chunk_size = 5_000usize; // deliberately not a multiple of 4096 or of buf.len
+        // SAFETY: `buf` is a local that outlives every chunk produced below
+        // and is never mutated for the duration of this test.
+        let chunks = unsafe { RawIoVec::chunks_of(&buf, chunk_size) };
+
+        assert_eq!(chunks.len(), 3, "12288 bytes in 5000-byte chunks should be [5000, 5000, 2288]");
+        assert_eq!(chunks[0].len, 5_000);
+        assert_eq!(chunks[1].len, 5_000);
+        assert_eq!(chunks[2].len, 2_288);
+
+        let total: usize = chunks.iter().map(|c| c.len).sum();
+        assert_eq!(total, buf.len, "chunks must cover every byte of the buffer exactly once");
+
+        let reassembled: Vec<u8> = chunks.iter().flat_map(|c| c.as_ref().to_vec()).collect();
+        assert_eq!(
+            reassembled,
+            buf.as_ref().to_vec(),
+            "concatenated chunks must reproduce the original buffer byte-for-byte, in order"
         );
     }
 }

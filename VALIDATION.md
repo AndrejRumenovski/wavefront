@@ -3,10 +3,14 @@
 This document is the evidence that `wavefront`'s Maxwell solver isn't just
 "code that runs" — it implements the Yee finite-difference scheme
 *correctly*, to the standard a numerical methods course would hold it to.
-It covers two independent numerical correctness checks: **dispersion** (does
-the solver's plane-wave phase velocity match the Yee scheme's exact closed
-form?) and **PML reflection** (does the absorbing boundary's actual
-reflection coefficient behave the way its own grading parameters predict?).
+It covers three independent checks: **dispersion** (does the solver's
+plane-wave phase velocity match the Yee scheme's exact closed form?), **PML
+reflection** (does the absorbing boundary's actual reflection coefficient
+behave the way its own grading parameters predict?), and **out-of-core
+operation at real scale** (does the mmap'd material grid and `O_DIRECT`
+snapshot writer actually work correctly at hundreds of millions of voxels,
+not just small test grids?) — the last of which surfaced and fixed a real
+data-corrupting bug in the snapshot writer.
 
 ## Numerical dispersion vs. the exact Yee scheme prediction
 
@@ -227,3 +231,97 @@ python3 validation/plot_pml_reflection.py
 The first command writes `validation/pml_reflection_data.csv` and prints the
 same summary statistics above to stderr; the second reads that CSV and
 regenerates `validation/pml_reflection.png`.
+
+## Out-of-core operation at real scale
+
+This was validated by actually running the `wavefront` binary at real
+multi-hundred-million-voxel scale, not just reasoning about the
+architecture — and doing so surfaced two things worth documenting exactly
+because they weren't apparent from reading the code alone.
+
+### Only the material grid is actually out-of-core
+
+The project's headline framing ("mmap'd voxel grids up to ~200 GB, larger
+than physical RAM") is true only of `src/layout.rs`'s `MaterialGrid` — the
+sole `memmap2::MmapMut`-backed structure. `CoeffGrid` (16 bytes/voxel) and
+`FieldGrid` (24 bytes/voxel) are both plain heap allocations (`Box<[...]>`)
+sized to the *entire* domain and held fully in RAM for the whole run;
+nothing pages them. This isn't a bug — an explicit leapfrog FDTD step
+genuinely needs live field state at hand every timestep — but it means the
+real ceiling on simulatable domain size is **RAM**, not disk, and the
+correct per-voxel accounting is considerably higher than a first read of
+`layout.rs` suggests:
+
+```
+field_grid (live)           24 bytes/voxel
++ 2x O_DIRECT staging buffers 48 bytes/voxel   (see below — easy to miss)
++ coeff_grid                 16 bytes/voxel
+= 88 bytes/voxel peak commit, not 40
+```
+
+The "2x staging buffers" line is `src/engine.rs`'s double-buffered snapshot
+writer (`AlignedBuffer::new(snapshot_bytes)`, called twice) — each buffer is
+sized to hold one *entire* serialized snapshot, so the writer's own RAM cost
+is `2 x field_grid`, on top of the live field grid itself. An initial
+attempt at this validation, sized only from the naive `field_grid +
+coeff_grid` formula (~18 GB on a 30 GB-RAM machine), missed this and drove
+the machine into swap in real time before being killed. A corrected run at
+512^3 voxels (~134M voxels) matched the full 88-bytes/voxel formula almost
+exactly: **11.77 GB measured peak RSS** against 11.81 GB predicted, zero
+swap activity, clean exit.
+
+### A real correctness bug, found only by running at scale
+
+The 512^3 run's output file (`wave_trajectory.bin`) came out **smaller than
+its 3 snapshots × 3,221,225,472 bytes should have been** — every single
+snapshot was short by exactly `1,073,745,920` bytes, i.e. every write
+stopped at exactly `0x7ffff000` (`2,147,479,552`) bytes in.
+
+That number is Linux's `MAX_RW_COUNT`: the kernel silently caps any single
+`write()`/`pwrite()`-family syscall (which is what `io_uring`'s
+`IORING_OP_WRITEV` resolves through) at `INT_MAX` rounded down to a page
+boundary, and does **not** raise an error for the difference — it just
+completes the syscall having transferred fewer bytes than requested. `rio`'s
+own `write_at` docs say exactly this: "Be sure to check the returned
+`io_uring_cqe`'s `res` field to see if a short write happened." Nothing in
+`src/engine.rs` did — `completion.wait()?` only propagated an OS-level
+error, discarding the actual byte count the write reported. Any domain past
+roughly 450 voxels per axis (well within what this project otherwise claims
+to support) would silently corrupt every snapshot it wrote, with the run
+itself reporting success (`exit status 0`).
+
+**Fix** (`src/engine.rs`): `RawIoVec::chunks_of` splits every snapshot into
+`MAX_DIRECT_IO_WRITE_BYTES`-sized (1 GiB, comfortably under the kernel cap)
+sub-writes; `drain_pending` waits on each chunk's completion and compares
+the returned byte count against what was requested, turning any future
+short write into a loud `io::Error` instead of silent corruption. Verified
+two ways: re-running the exact same 512^3 case produced a file matching the
+expected size exactly (`9,663,676,416` bytes — no shortfall), and the
+previously past-EOF region (the final block of the final snapshot, byte
+offset `2 x snapshot_bytes + snapshot_bytes - block_bytes`, entirely beyond
+where the old bug would have stopped writing) now exists, parses as
+well-formed finite `f32` values, and is correctly all-zero — the wave from
+the point source, 21 timesteps in, hadn't propagated anywhere near that far
+yet. `engine::tests::raw_io_vec_chunks_of_covers_the_whole_buffer_with_no_gaps_or_overlap`
+is a fast, `O_DIRECT`-free regression test for the chunk-boundary math
+itself (an actual multi-gigabyte write isn't practical to run in CI).
+
+### Reproducing this
+
+```sh
+RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
+    cargo +nightly build --release
+./target/release/wavefront --nx 512 --ny 512 --nz 512 \
+    --steps 21 --snapshot-every 10 \
+    --materials /path/on/a/real/disk/materials.grid \
+    --output /path/on/a/real/disk/wave_trajectory.bin
+```
+
+Expect ~12 GB peak RSS and a `wave_trajectory.bin` of exactly
+`512^3 * 24 * 3 = 9,663,676,416` bytes. Point `--materials`/`--output` at a
+real block device (not `tmpfs`, which is RAM-backed and would defeat the
+point) with several GB free — `O_DIRECT` needs ext4/xfs/btrfs, per
+`Cargo.toml`'s build notes. This machine's only disk with spare
+capacity was a spinning HDD, not NVMe, so this validates the mmap paging and
+`O_DIRECT` correctness at real scale but not NVMe-class throughput/latency —
+still unexercised (see `HANDOFF.md`'s "Next steps").
