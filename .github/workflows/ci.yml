@@ -43,3 +43,6 @@ jobs:
 
       - name: Run convergence study (numerical validation)
         run: cargo run --release --example convergence_study
+
+      - name: Run PML reflection study (numerical validation)
+        run: cargo run --release --example pml_reflection_study

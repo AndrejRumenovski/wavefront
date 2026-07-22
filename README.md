@@ -6,10 +6,11 @@ voxelized material grid (up to ~200 GB, mmap-backed, larger than physical
 RAM), on a single Linux workstation.
 
 **[VALIDATION.md](VALIDATION.md)** measures the solver's numerical
-dispersion against the Yee scheme's own exact closed-form prediction and
-confirms second-order convergence (measured order 2.16 vs. theoretical
-2.0) — the evidence that this is a numerically correct FDTD implementation,
-not just code that produces plausible-looking output.
+dispersion against the Yee scheme's own exact closed-form prediction
+(confirming second-order convergence — measured order 2.16 vs. theoretical
+2.0) and the CPML absorbing boundary's actual reflection coefficient against
+its configured target — the evidence that this is a numerically correct
+FDTD implementation, not just code that produces plausible-looking output.
 
 - Material grid: a flat, disk-resident byte array, one byte per voxel,
   memory-mapped via `memmap2` (`src/layout.rs`).
@@ -211,16 +212,28 @@ request.
 
 ## Validation
 
-`examples/convergence_study.rs` is a separate, deeper correctness check: it
-measures the solver's numerical phase velocity against the Yee scheme's own
-exact closed-form dispersion relation at four grid resolutions, using the
-same field-update kernels the production engine calls. See
-**[VALIDATION.md](VALIDATION.md)** for the methodology and results.
+Two examples are separate, deeper correctness checks, using the same
+field-update kernels the production engine calls. See
+**[VALIDATION.md](VALIDATION.md)** for the methodology and results of both.
+
+`examples/convergence_study.rs` measures the solver's numerical phase
+velocity against the Yee scheme's own exact closed-form dispersion relation
+at four grid resolutions:
 
 ```sh
 RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
     cargo +nightly run --release --example convergence_study
 python3 validation/plot_convergence.py   # regenerates validation/convergence.png
+```
+
+`examples/pml_reflection_study.rs` measures the CPML absorbing boundary's
+actual reflection coefficient at four layer thicknesses, via two-run
+subtraction against a reflection-free reference domain:
+
+```sh
+RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
+    cargo +nightly run --release --example pml_reflection_study
+python3 validation/plot_pml_reflection.py   # regenerates validation/pml_reflection.png
 ```
 
 ## License

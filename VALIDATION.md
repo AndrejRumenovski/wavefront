@@ -1,8 +1,14 @@
-# Validation: numerical dispersion vs. the exact Yee scheme prediction
+# Validation
 
 This document is the evidence that `wavefront`'s Maxwell solver isn't just
 "code that runs" — it implements the Yee finite-difference scheme
 *correctly*, to the standard a numerical methods course would hold it to.
+It covers two independent numerical correctness checks: **dispersion** (does
+the solver's plane-wave phase velocity match the Yee scheme's exact closed
+form?) and **PML reflection** (does the absorbing boundary's actual
+reflection coefficient behave the way its own grading parameters predict?).
+
+## Numerical dispersion vs. the exact Yee scheme prediction
 
 ## What's being validated
 
@@ -116,7 +122,7 @@ actually be the suspicious result here; visible point-to-point scatter
 around the right trend and the right order of magnitude is what an honest
 empirical measurement of this quantity looks like.
 
-## Reproducing this
+### Reproducing this
 
 ```sh
 RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
@@ -128,3 +134,96 @@ The first command writes `validation/convergence_data.csv` and prints the
 same summary statistics above to stderr; the second reads that CSV and
 regenerates `validation/convergence.png` (requires `matplotlib`, a one-off
 analysis dependency — not a crate dependency, see `Cargo.toml`).
+
+## CPML reflection coefficient vs. layer thickness
+
+The CPML absorbing boundary (`src/layout.rs`'s `PmlConfig`/`PmlProfile1D`/
+`PmlAux`/`PmlContext`, `src/fdtd.rs`'s `update_h_field_pml`/
+`update_e_field_pml`) was previously verified only qualitatively: an
+energy-decay comparison showing that, with PML on, a point source's total
+field energy decays monotonically once the wave reaches the boundary,
+whereas with PML off it bounces/grows from reflections. That's evidence the
+PML absorbs *something*, but it can't distinguish a good PML from a merely
+adequate one, and it says nothing about whether the boundary's behavior
+tracks its own configured target.
+
+### What's being validated
+
+`PmlConfig::target_reflection` (`R0`, default `1e-6`) is the analytic
+normal-incidence reflection coefficient the graded conductivity profile is
+derived to hit, in the continuous limit (Taflove & Hagness, ch. 7). This
+study measures the *actual*, discretized boundary's reflection coefficient
+at several PML thicknesses and checks that it (a) shrinks as the layer gets
+thicker — the qualitative behavior a correctly graded absorber must show —
+and (b) lands in the right ballpark of `R0`, not just "smaller than a bare
+wall."
+
+### Method: two-run subtraction
+
+`examples/pml_reflection_study.rs` reuses `convergence_study.rs`'s
+full-transverse-plane sheet source (a clean 1D plane wave in a domain only
+`BLOCK_DIM` voxels wide in Y/Z), but a single probe trace near a
+PML-terminated boundary mixes the incident wave together with whatever
+reflects back — there's no way to separate them from one trace alone. So
+the study runs the identical driven wave twice, at identical source-to-probe
+geometry:
+
+- **Test run**: a short domain with CPML (the thickness under test) at both
+  X faces. The probe sees incident + reflected.
+- **Reference run**: PML disabled, with both X boundaries pushed far enough
+  away that no reflection from either one can return to the probe within the
+  run.
+
+Because the medium is homogeneous vacuum and both runs share the same
+source waveform and source-to-probe distance, causality guarantees the two
+probe traces are identical until a reflection first arrives — so subtracting
+the reference trace from the test trace isolates the reflected wave alone.
+Quadrature demodulation (the same technique the dispersion study uses to
+extract phase) then recovers each wave's steady-state amplitude, and the
+reflection coefficient is the ratio of the two.
+
+Y and Z stay a periodic-wrap single block wide, exactly as in
+`convergence_study.rs`, with `PmlCoeffs::IDENTITY` passed for those axes'
+CPML correction: the correction only ever modifies a *raw derivative* along
+its axis, and this study's field is translationally uniform across Y and Z
+by construction, so every raw Y/Z derivative is identically zero regardless
+of what coefficients would multiply it. Only the X-axis profile — built
+directly from `PmlProfile1D::build`, not the full 3-axis `PmlContext::build`
+— ever does real work.
+
+### Result
+
+![Measured PML reflection coefficient vs. layer thickness](validation/pml_reflection.png)
+
+| PML thickness (voxels) | Measured \|R\| |
+|---:|---:|
+| 8  | 2.68e-3 |
+| 16 | 1.05e-3 |
+| 32 | 5.38e-5 |
+| 64 | 6.43e-6 |
+
+- **Monotonic**: reflection strictly decreases at every step as the layer
+  gets thicker, across a 400x range from thinnest to thickest.
+- **Converges toward the target**: the thickest layer tested (64 voxels)
+  measures `6.4e-6`, within an order of magnitude of
+  `PmlConfig::default().target_reflection = 1e-6` — the discretized,
+  staircased grid can't hit the continuous-limit target exactly, but lands
+  in the right neighborhood, and closes in on it as the layer thickens
+  (exactly as CPML theory predicts).
+- The thinnest layer tested (8 voxels, `PmlConfig::default`'s own thickness)
+  still reflects under 0.3% — small enough that the point-source energy-decay
+  check from the CPML implementation session couldn't have distinguished it
+  from a much better layer; this study is the first thing in the repo that
+  actually can.
+
+### Reproducing this
+
+```sh
+RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
+    cargo +nightly run --release --example pml_reflection_study
+python3 validation/plot_pml_reflection.py
+```
+
+The first command writes `validation/pml_reflection_data.csv` and prints the
+same summary statistics above to stderr; the second reads that CSV and
+regenerates `validation/pml_reflection.png`.
