@@ -3,13 +3,26 @@
 //!
 //! This binary is a thin driver over the `wavefront` library crate
 //! (`src/lib.rs`), which owns the actual `layout`/`fdtd`/`engine`/`scene`/
-//! `source` modules -- shared with the `wavefront-view` post-processing
-//! tool in `src/bin/`.
+//! `source`/`probe` modules -- shared with the `wavefront-view`
+//! post-processing tool in `src/bin/`.
 //!
 //! Absent a `--scene` file, it falls back to a single demonstration
 //! scenario -- a dielectric sphere embedded in vacuum -- excited by a
 //! configurable point source (default: a Ricker wavelet on Ez at the
 //! domain center) re-injected every timestep.
+//!
+//! ## Multiple sources and probes
+//!
+//! `engine::run` has always accepted a `&[Source]`/`&mut [Probe]` slice, but
+//! until now the CLI only ever built exactly one of each. The individual
+//! `--source-x/-y/-z/-component/-waveform/-freq/-amplitude` and
+//! `--probe-x/-y/-z/-component/-freq/-start` flags still work exactly as
+//! before and configure the *first* source/probe (auto-created on first
+//! use); repeat the new `--source <key=value,...>` / `--probe
+//! <key=value,...>` flags to add more. Both forms build into the same
+//! underlying `Vec<SourceSpec>`/`Vec<ProbeSpec>`, so mixing them (e.g. the
+//! simple flags for a primary source, `--source ...` for a couple more) is
+//! well-defined, not an error.
 
 use wavefront::layout::{
     CoeffGrid, FieldGrid, GridDims, MaterialGrid, MaterialId, MaterialTable, PmlConfig,
@@ -41,38 +54,78 @@ struct Config {
     /// Optional plain-text scene file (see `src/scene.rs`); falls back to
     /// the hardcoded demo sphere if not given.
     scene_path: Option<PathBuf>,
-    /// Source voxel position; defaults to the domain center if unset.
-    source_pos: (Option<usize>, Option<usize>, Option<usize>),
-    source_component: FieldComponent,
-    source_waveform: WaveformKind,
-    /// Source drive frequency, in Hz; defaults to `1 / (20 * dt)` (20
-    /// samples per period) if unset.
-    source_freq: Option<f32>,
-    source_amplitude: f32,
-    /// Probe voxel position; unset (all three unset) disables the probe
-    /// entirely. All three or none must be given together.
-    probe_pos: (Option<usize>, Option<usize>, Option<usize>),
-    probe_component: probe::FieldComponent,
-    /// Frequencies (Hz) the probe's running DFT tracks; empty disables the
-    /// probe. Required together with `probe_pos` to enable one.
-    probe_freqs: Vec<f32>,
-    /// Simulation time (seconds) before which the probe's accumulators
-    /// ignore samples, so a source's startup transient doesn't contaminate
-    /// a frequency response that's only meaningful once the field has
-    /// settled.
-    probe_start: f32,
+    /// Empty means "no sources configured yet" -- [`build_sources`] falls
+    /// back to a single default source in that case, matching this CLI's
+    /// original single-source behavior exactly. Once any source has been
+    /// configured (by either flag style), that fallback no longer applies.
+    sources: Vec<SourceSpec>,
+    /// Empty means no probes at all (unlike `sources`, there is no
+    /// probe-by-default fallback -- probes are opt-in).
+    probes: Vec<ProbeSpec>,
     materials_path: PathBuf,
     output_path: PathBuf,
 }
 
 /// CLI-selectable source waveform shape. Translated into a concrete
 /// `source::Waveform` (with its `t0`/`spread` parameters derived from the
-/// drive frequency) once `dt` is known -- see [`build_waveform`].
+/// drive frequency) once `dt` is known -- see [`build_one_source`].
 #[derive(Debug, Clone, Copy)]
 enum WaveformKind {
     Gaussian,
     Sinusoid,
     Ricker,
+}
+
+/// One source's configuration, before its position/frequency defaults
+/// (domain center, `1/(20*dt)`) are resolved -- either produced by the
+/// `--source-*` shorthand flags (mutating `sources[0]`, auto-created) or
+/// parsed whole from a `--source <key=value,...>` flag.
+#[derive(Debug, Clone)]
+struct SourceSpec {
+    x: Option<usize>,
+    y: Option<usize>,
+    z: Option<usize>,
+    component: FieldComponent,
+    waveform: WaveformKind,
+    freq: Option<f32>,
+    amplitude: f32,
+}
+
+impl Default for SourceSpec {
+    fn default() -> Self {
+        Self {
+            x: None,
+            y: None,
+            z: None,
+            component: FieldComponent::Ez,
+            waveform: WaveformKind::Ricker,
+            freq: None,
+            amplitude: 1.0,
+        }
+    }
+}
+
+/// One probe's configuration. Unlike [`SourceSpec`], `x`/`y`/`z`/`freqs`
+/// have no usable default -- [`build_one_probe`] requires all of them.
+#[derive(Debug, Clone, Default)]
+struct ProbeSpec {
+    x: Option<usize>,
+    y: Option<usize>,
+    z: Option<usize>,
+    component: ProbeComponentSpec,
+    freqs: Vec<f32>,
+    start: f32,
+}
+
+/// Thin wrapper so [`ProbeSpec`] can `#[derive(Default)]` (`probe::FieldComponent`
+/// itself has no `Default` impl, and shouldn't need one just for this).
+#[derive(Debug, Clone, Copy)]
+struct ProbeComponentSpec(probe::FieldComponent);
+
+impl Default for ProbeComponentSpec {
+    fn default() -> Self {
+        Self(probe::FieldComponent::Ez)
+    }
 }
 
 impl Default for Config {
@@ -87,19 +140,115 @@ impl Default for Config {
             snapshot_every: 20,
             pml_thickness: PmlConfig::default().thickness,
             scene_path: None,
-            source_pos: (None, None, None),
-            source_component: FieldComponent::Ez,
-            source_waveform: WaveformKind::Ricker,
-            source_freq: None,
-            source_amplitude: 1.0,
-            probe_pos: (None, None, None),
-            probe_component: probe::FieldComponent::Ez,
-            probe_freqs: Vec::new(),
-            probe_start: 0.0,
+            sources: Vec::new(),
+            probes: Vec::new(),
             materials_path: PathBuf::from("materials.grid"),
             output_path: PathBuf::from("wave_trajectory.bin"),
         }
     }
+}
+
+fn parse_source_component(v: &str) -> Result<FieldComponent, String> {
+    match v {
+        "ex" => Ok(FieldComponent::Ex),
+        "ey" => Ok(FieldComponent::Ey),
+        "ez" => Ok(FieldComponent::Ez),
+        other => Err(format!("invalid source component: {other} (expected ex, ey, or ez)")),
+    }
+}
+
+fn parse_probe_component(v: &str) -> Result<probe::FieldComponent, String> {
+    match v {
+        "ex" => Ok(probe::FieldComponent::Ex),
+        "ey" => Ok(probe::FieldComponent::Ey),
+        "ez" => Ok(probe::FieldComponent::Ez),
+        "hx" => Ok(probe::FieldComponent::Hx),
+        "hy" => Ok(probe::FieldComponent::Hy),
+        "hz" => Ok(probe::FieldComponent::Hz),
+        other => Err(format!(
+            "invalid probe component: {other} (expected ex, ey, ez, hx, hy, or hz)"
+        )),
+    }
+}
+
+fn parse_waveform_kind(v: &str) -> Result<WaveformKind, String> {
+    match v {
+        "gaussian" => Ok(WaveformKind::Gaussian),
+        "sinusoid" => Ok(WaveformKind::Sinusoid),
+        "ricker" => Ok(WaveformKind::Ricker),
+        other => Err(format!("invalid waveform: {other} (expected gaussian, sinusoid, or ricker)")),
+    }
+}
+
+/// Parses one `--source <key=value,...>` flag's value into a full
+/// [`SourceSpec`]. Recognized keys: `x`, `y`, `z`, `component`, `waveform`,
+/// `freq`, `amplitude` -- any key not given keeps [`SourceSpec::default`]'s
+/// value (so e.g. `--source x=10,y=10,z=10` is valid, using default
+/// component/waveform/freq/amplitude).
+fn parse_source_spec(s: &str) -> Result<SourceSpec, String> {
+    let mut spec = SourceSpec::default();
+    for pair in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("--source: expected key=value, got '{pair}'"))?;
+        let value = value.trim();
+        match key.trim() {
+            "x" => spec.x = Some(value.parse().map_err(|_| format!("--source: invalid x '{value}'"))?),
+            "y" => spec.y = Some(value.parse().map_err(|_| format!("--source: invalid y '{value}'"))?),
+            "z" => spec.z = Some(value.parse().map_err(|_| format!("--source: invalid z '{value}'"))?),
+            "component" => spec.component = parse_source_component(value)?,
+            "waveform" => spec.waveform = parse_waveform_kind(value)?,
+            "freq" => spec.freq = Some(value.parse().map_err(|_| format!("--source: invalid freq '{value}'"))?),
+            "amplitude" => {
+                spec.amplitude = value.parse().map_err(|_| format!("--source: invalid amplitude '{value}'"))?
+            }
+            other => return Err(format!("--source: unknown key '{other}'")),
+        }
+    }
+    Ok(spec)
+}
+
+/// Parses one `--probe <key=value,...>` flag's value into a full
+/// [`ProbeSpec`]. Recognized keys: `x`, `y`, `z`, `component`, `freq`
+/// (semicolon-separated, e.g. `freq=3e10;6e10` -- commas are already taken
+/// by the outer key=value separator), `start`.
+fn parse_probe_spec(s: &str) -> Result<ProbeSpec, String> {
+    let mut spec = ProbeSpec::default();
+    for pair in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("--probe: expected key=value, got '{pair}'"))?;
+        let value = value.trim();
+        match key.trim() {
+            "x" => spec.x = Some(value.parse().map_err(|_| format!("--probe: invalid x '{value}'"))?),
+            "y" => spec.y = Some(value.parse().map_err(|_| format!("--probe: invalid y '{value}'"))?),
+            "z" => spec.z = Some(value.parse().map_err(|_| format!("--probe: invalid z '{value}'"))?),
+            "component" => spec.component = ProbeComponentSpec(parse_probe_component(value)?),
+            "freq" => {
+                spec.freqs = value
+                    .split(';')
+                    .map(|f| f.trim().parse().map_err(|_| format!("--probe: invalid freq '{f}'")))
+                    .collect::<Result<Vec<f32>, String>>()?
+            }
+            "start" => spec.start = value.parse().map_err(|_| format!("--probe: invalid start '{value}'"))?,
+            other => return Err(format!("--probe: unknown key '{other}'")),
+        }
+    }
+    Ok(spec)
+}
+
+fn first_source_mut(config: &mut Config) -> &mut SourceSpec {
+    if config.sources.is_empty() {
+        config.sources.push(SourceSpec::default());
+    }
+    &mut config.sources[0]
+}
+
+fn first_probe_mut(config: &mut Config) -> &mut ProbeSpec {
+    if config.probes.is_empty() {
+        config.probes.push(ProbeSpec::default());
+    }
+    &mut config.probes[0]
 }
 
 fn print_usage() {
@@ -116,18 +265,24 @@ fn print_usage() {
          \x20   --snapshot-every <N>   timesteps between snapshot writes [default: 20]\n\
          \x20   --pml-thickness <N>    absorbing boundary depth in voxels, 0 disables it [default: 8]\n\
          \x20   --scene <PATH>         plain-text scene file (see src/scene.rs); omit for the demo sphere\n\
-         \x20   --source-x/-y/-z <N>   source voxel position [default: domain center]\n\
-         \x20   --source-component <C> field component the source drives: ex, ey, ez [default: ez]\n\
-         \x20   --source-waveform <W>  gaussian, sinusoid, or ricker [default: ricker]\n\
-         \x20   --source-freq <HZ>     source drive frequency [default: 1/(20*dt)]\n\
-         \x20   --source-amplitude <A> source peak amplitude [default: 1.0]\n\
-         \x20   --probe-x/-y/-z <N>    probe voxel position; enables the probe together with --probe-freq\n\
-         \x20   --probe-component <C>  field component the probe tracks: ex, ey, ez, hx, hy, hz [default: ez]\n\
-         \x20   --probe-freq <HZ,...>  comma-separated frequencies (Hz) the probe's running DFT tracks\n\
-         \x20   --probe-start <SECONDS> simulation time before which the probe ignores samples [default: 0.0]\n\
+         \x20   --source-x/-y/-z <N>   first source's voxel position [default: domain center]\n\
+         \x20   --source-component <C> first source's field component: ex, ey, ez [default: ez]\n\
+         \x20   --source-waveform <W>  first source's waveform: gaussian, sinusoid, or ricker [default: ricker]\n\
+         \x20   --source-freq <HZ>     first source's drive frequency [default: 1/(20*dt)]\n\
+         \x20   --source-amplitude <A> first source's peak amplitude [default: 1.0]\n\
+         \x20   --source <SPEC>        add another source: key=value,... (x,y,z,component,waveform,freq,amplitude)\n\
+         \x20   --probe-x/-y/-z <N>    first probe's voxel position; enables it together with --probe-freq\n\
+         \x20   --probe-component <C>  first probe's field component: ex, ey, ez, hx, hy, hz [default: ez]\n\
+         \x20   --probe-freq <HZ,...>  comma-separated frequencies (Hz) the first probe's running DFT tracks\n\
+         \x20   --probe-start <SECONDS> first probe's ignore-samples-before time [default: 0.0]\n\
+         \x20   --probe <SPEC>         add another probe: key=value,... (x,y,z,component,freq[;freq...],start)\n\
          \x20   --materials <PATH>     backing file for the mmap'd material grid [default: materials.grid]\n\
          \x20   --output <PATH>        Direct I/O snapshot stream path [default: wave_trajectory.bin]\n\
-         \x20   -h, --help             print this message"
+         \x20   -h, --help             print this message\n\n\
+         Repeat --source/--probe to configure more than one; the individual\n\
+         --source-*/--probe-* flags configure only the first. --probe's freq\n\
+         list uses ';' (quote the whole value in your shell, e.g.\n\
+         --probe \"x=10,y=10,z=10,freq=3e10;6e10\")."
     );
 }
 
@@ -163,63 +318,69 @@ fn parse_args() -> Result<Config, String> {
                 config.pml_thickness = parse_num("--pml-thickness", next_value("--pml-thickness")?)?
             }
             "--scene" => config.scene_path = Some(PathBuf::from(next_value("--scene")?)),
-            "--source-x" => config.source_pos.0 = Some(parse_num("--source-x", next_value("--source-x")?)?),
-            "--source-y" => config.source_pos.1 = Some(parse_num("--source-y", next_value("--source-y")?)?),
-            "--source-z" => config.source_pos.2 = Some(parse_num("--source-z", next_value("--source-z")?)?),
+            "--source-x" => {
+                let v = parse_num("--source-x", next_value("--source-x")?)?;
+                first_source_mut(&mut config).x = Some(v);
+            }
+            "--source-y" => {
+                let v = parse_num("--source-y", next_value("--source-y")?)?;
+                first_source_mut(&mut config).y = Some(v);
+            }
+            "--source-z" => {
+                let v = parse_num("--source-z", next_value("--source-z")?)?;
+                first_source_mut(&mut config).z = Some(v);
+            }
             "--source-component" => {
-                let v = next_value("--source-component")?;
-                config.source_component = match v.as_str() {
-                    "ex" => FieldComponent::Ex,
-                    "ey" => FieldComponent::Ey,
-                    "ez" => FieldComponent::Ez,
-                    other => return Err(format!("invalid --source-component: {other} (expected ex, ey, or ez)")),
-                };
+                let v = parse_source_component(&next_value("--source-component")?)?;
+                first_source_mut(&mut config).component = v;
             }
             "--source-waveform" => {
-                let v = next_value("--source-waveform")?;
-                config.source_waveform = match v.as_str() {
-                    "gaussian" => WaveformKind::Gaussian,
-                    "sinusoid" => WaveformKind::Sinusoid,
-                    "ricker" => WaveformKind::Ricker,
-                    other => {
-                        return Err(format!(
-                            "invalid --source-waveform: {other} (expected gaussian, sinusoid, or ricker)"
-                        ))
-                    }
-                };
+                let v = parse_waveform_kind(&next_value("--source-waveform")?)?;
+                first_source_mut(&mut config).waveform = v;
             }
-            "--source-freq" => config.source_freq = Some(parse_float("--source-freq", next_value("--source-freq")?)?),
+            "--source-freq" => {
+                let v = parse_float("--source-freq", next_value("--source-freq")?)?;
+                first_source_mut(&mut config).freq = Some(v);
+            }
             "--source-amplitude" => {
-                config.source_amplitude = parse_float("--source-amplitude", next_value("--source-amplitude")?)?
+                let v = parse_float("--source-amplitude", next_value("--source-amplitude")?)?;
+                first_source_mut(&mut config).amplitude = v;
             }
-            "--probe-x" => config.probe_pos.0 = Some(parse_num("--probe-x", next_value("--probe-x")?)?),
-            "--probe-y" => config.probe_pos.1 = Some(parse_num("--probe-y", next_value("--probe-y")?)?),
-            "--probe-z" => config.probe_pos.2 = Some(parse_num("--probe-z", next_value("--probe-z")?)?),
+            "--source" => {
+                let spec = parse_source_spec(&next_value("--source")?)?;
+                config.sources.push(spec);
+            }
+            "--probe-x" => {
+                let v = parse_num("--probe-x", next_value("--probe-x")?)?;
+                first_probe_mut(&mut config).x = Some(v);
+            }
+            "--probe-y" => {
+                let v = parse_num("--probe-y", next_value("--probe-y")?)?;
+                first_probe_mut(&mut config).y = Some(v);
+            }
+            "--probe-z" => {
+                let v = parse_num("--probe-z", next_value("--probe-z")?)?;
+                first_probe_mut(&mut config).z = Some(v);
+            }
             "--probe-component" => {
-                let v = next_value("--probe-component")?;
-                config.probe_component = match v.as_str() {
-                    "ex" => probe::FieldComponent::Ex,
-                    "ey" => probe::FieldComponent::Ey,
-                    "ez" => probe::FieldComponent::Ez,
-                    "hx" => probe::FieldComponent::Hx,
-                    "hy" => probe::FieldComponent::Hy,
-                    "hz" => probe::FieldComponent::Hz,
-                    other => {
-                        return Err(format!(
-                            "invalid --probe-component: {other} (expected ex, ey, ez, hx, hy, or hz)"
-                        ))
-                    }
-                };
+                let v = parse_probe_component(&next_value("--probe-component")?)?;
+                first_probe_mut(&mut config).component = ProbeComponentSpec(v);
             }
             "--probe-freq" => {
                 let v = next_value("--probe-freq")?;
-                config.probe_freqs = v
+                let freqs = v
                     .split(',')
                     .map(|s| parse_float("--probe-freq", s.to_string()))
                     .collect::<Result<Vec<f32>, String>>()?;
+                first_probe_mut(&mut config).freqs = freqs;
             }
             "--probe-start" => {
-                config.probe_start = parse_float("--probe-start", next_value("--probe-start")?)?
+                let v = parse_float("--probe-start", next_value("--probe-start")?)?;
+                first_probe_mut(&mut config).start = v;
+            }
+            "--probe" => {
+                let spec = parse_probe_spec(&next_value("--probe")?)?;
+                config.probes.push(spec);
             }
             "--materials" => config.materials_path = PathBuf::from(next_value("--materials")?),
             "--output" => config.output_path = PathBuf::from(next_value("--output")?),
@@ -263,18 +424,17 @@ fn voxelize_demo_sphere(grid: &mut MaterialGrid) {
     }
 }
 
-/// Builds the single configured [`Source`] from CLI options, resolving its
-/// position to the domain center and its frequency to `1/(20*dt)` wherever
-/// the user didn't override them, and translating the CLI's waveform
-/// *shape* selection into concrete `t0`/`spread` parameters derived from
-/// that frequency.
-fn build_source(config: &Config, dims: GridDims) -> Source {
-    let x = config.source_pos.0.unwrap_or(dims.nx / 2);
-    let y = config.source_pos.1.unwrap_or(dims.ny / 2);
-    let z = config.source_pos.2.unwrap_or(dims.nz / 2);
-    let freq_hz = config.source_freq.unwrap_or(1.0 / (20.0 * config.dt));
+/// Resolves one [`SourceSpec`] into a concrete [`Source`]: position
+/// defaults to the domain center, frequency to `1/(20*dt)`, wherever the
+/// spec left them unset, and the waveform *shape* selection is translated
+/// into concrete `t0`/`spread` parameters derived from that frequency.
+fn build_one_source(spec: &SourceSpec, dt: f32, dims: GridDims) -> Source {
+    let x = spec.x.unwrap_or(dims.nx / 2);
+    let y = spec.y.unwrap_or(dims.ny / 2);
+    let z = spec.z.unwrap_or(dims.nz / 2);
+    let freq_hz = spec.freq.unwrap_or(1.0 / (20.0 * dt));
 
-    let waveform = match config.source_waveform {
+    let waveform = match spec.waveform {
         WaveformKind::Sinusoid => Waveform::Sinusoid { freq_hz },
         WaveformKind::Ricker => Waveform::RickerWavelet {
             peak_freq_hz: freq_hz,
@@ -293,32 +453,41 @@ fn build_source(config: &Config, dims: GridDims) -> Source {
         x,
         y,
         z,
-        component: config.source_component,
-        amplitude: config.source_amplitude,
+        component: spec.component,
+        amplitude: spec.amplitude,
         waveform,
     }
 }
 
-/// Builds the configured [`Probe`] from CLI options, if `--probe-x/-y/-z`
-/// and `--probe-freq` were both given (all-or-nothing: a partial
-/// specification -- e.g. a position with no frequency -- is a usage error,
-/// not silently ignored).
-fn build_probe(config: &Config, dims: GridDims) -> Result<Option<Probe>, String> {
-    let (px, py, pz) = config.probe_pos;
-    let has_pos = px.is_some() || py.is_some() || pz.is_some();
-    let has_freq = !config.probe_freqs.is_empty();
-
-    if !has_pos && !has_freq {
-        return Ok(None);
+/// Builds every configured source. An empty `config.sources` (no
+/// `--source-*`/`--source` flags given at all) falls back to one default
+/// source, matching this CLI's original single-source-by-default behavior.
+fn build_sources(config: &Config, dims: GridDims) -> Vec<Source> {
+    if config.sources.is_empty() {
+        vec![build_one_source(&SourceSpec::default(), config.dt, dims)]
+    } else {
+        config
+            .sources
+            .iter()
+            .map(|spec| build_one_source(spec, config.dt, dims))
+            .collect()
     }
-    let (Some(x), Some(y), Some(z)) = (px, py, pz) else {
+}
+
+/// Resolves one [`ProbeSpec`] into a concrete [`Probe`]. Unlike sources,
+/// position and frequency have no usable default -- both are required.
+fn build_one_probe(spec: &ProbeSpec, dims: GridDims) -> Result<Probe, String> {
+    let (Some(x), Some(y), Some(z)) = (spec.x, spec.y, spec.z) else {
         return Err(
-            "--probe-x, --probe-y, and --probe-z must all be given together to enable a probe"
+            "each probe requires x, y, and z (via --probe-x/-y/-z, or x=/y=/z= in --probe)"
                 .to_string(),
         );
     };
-    if !has_freq {
-        return Err("--probe-freq is required (comma-separated Hz values) to enable a probe".to_string());
+    if spec.freqs.is_empty() {
+        return Err(
+            "each probe requires at least one frequency (via --probe-freq, or freq= in --probe)"
+                .to_string(),
+        );
     }
     if x >= dims.nx || y >= dims.ny || z >= dims.nz {
         return Err(format!(
@@ -327,14 +496,13 @@ fn build_probe(config: &Config, dims: GridDims) -> Result<Option<Probe>, String>
         ));
     }
 
-    Ok(Some(Probe::new(
-        x,
-        y,
-        z,
-        config.probe_component,
-        config.probe_freqs.clone(),
-        config.probe_start,
-    )))
+    Ok(Probe::new(x, y, z, spec.component.0, spec.freqs.clone(), spec.start))
+}
+
+/// Builds every configured probe (empty if none were configured -- probes
+/// are opt-in, unlike sources).
+fn build_probes(config: &Config, dims: GridDims) -> Result<Vec<Probe>, String> {
+    config.probes.iter().map(|spec| build_one_probe(spec, dims)).collect()
 }
 
 fn run(config: Config) -> Result<(), String> {
@@ -375,20 +543,20 @@ fn run(config: Config) -> Result<(), String> {
     let coeff_grid = CoeffGrid::build(&material_grid, &material_table);
 
     let mut field_grid = FieldGrid::zeroed(dims);
-    let source = build_source(&config, dims);
-    eprintln!(
-        "wavefront: source at ({}, {}, {}) driving {:?}, {:?}",
-        source.x, source.y, source.z, source.component, source.waveform
-    );
+    let sources = build_sources(&config, dims);
+    for source in &sources {
+        eprintln!(
+            "wavefront: source at ({}, {}, {}) driving {:?}, {:?}",
+            source.x, source.y, source.z, source.component, source.waveform
+        );
+    }
 
-    let mut probes: Vec<Probe> = build_probe(&config, dims)?.into_iter().collect();
-    if let Some(probe) = probes.first() {
+    let mut probes = build_probes(&config, dims)?;
+    for probe in &probes {
         let (x, y, z) = probe.position();
         eprintln!(
-            "wavefront: probe at ({x}, {y}, {z}) tracking {:?} at {} frequency(s), recording from t={}s",
-            probe.component(),
-            config.probe_freqs.len(),
-            config.probe_start
+            "wavefront: probe at ({x}, {y}, {z}) tracking {:?}",
+            probe.component()
         );
     }
 
@@ -411,7 +579,7 @@ fn run(config: Config) -> Result<(), String> {
         &coeff_grid,
         pml_context_ref,
         &mut pml_aux_grid,
-        &[source],
+        &sources,
         &mut probes,
         &engine_config,
     )

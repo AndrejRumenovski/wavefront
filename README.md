@@ -119,18 +119,36 @@ re-injected every timestep.
 | `--snapshot-every`      | Timesteps between snapshot writes                     | `20`                 |
 | `--pml-thickness <N>`  | Absorbing boundary depth, in voxels, at each domain face. `0` disables it (fully reflective boundary) | `8` |
 | `--scene <PATH>`        | Plain-text scene file (see below); omit for the demo sphere | (demo sphere) |
-| `--source-x/-y/-z <N>`  | Source voxel position                                | domain center        |
-| `--source-component <C>`| Field component the source drives: `ex`, `ey`, `ez`  | `ez`                 |
-| `--source-waveform <W>` | `gaussian`, `sinusoid`, or `ricker`                   | `ricker`             |
-| `--source-freq <HZ>`    | Source drive frequency                                | `1 / (20 * dt)`      |
-| `--source-amplitude <A>`| Source peak amplitude                                 | `1.0`                |
-| `--probe-x/-y/-z <N>`   | Probe voxel position -- all three required together with `--probe-freq` to enable the probe | (disabled) |
-| `--probe-component <C>` | Field component the probe tracks: `ex`, `ey`, `ez`, `hx`, `hy`, `hz` | `ez`  |
-| `--probe-freq <HZ,...>` | Comma-separated frequencies (Hz) the probe's running DFT tracks | (disabled) |
-| `--probe-start <SECONDS>`| Simulation time before which the probe ignores samples (skips startup transient) | `0.0` |
+| `--source-x/-y/-z <N>`  | First source's voxel position                        | domain center        |
+| `--source-component <C>`| First source's field component: `ex`, `ey`, `ez`     | `ez`                 |
+| `--source-waveform <W>` | First source's waveform: `gaussian`, `sinusoid`, or `ricker` | `ricker`      |
+| `--source-freq <HZ>`    | First source's drive frequency                        | `1 / (20 * dt)`      |
+| `--source-amplitude <A>`| First source's peak amplitude                         | `1.0`                |
+| `--source <SPEC>`       | Add another source: `key=value,...` (`x`, `y`, `z`, `component`, `waveform`, `freq`, `amplitude`) | (none) |
+| `--probe-x/-y/-z <N>`   | First probe's voxel position -- all three required together with `--probe-freq` to enable it | (disabled) |
+| `--probe-component <C>` | First probe's field component: `ex`, `ey`, `ez`, `hx`, `hy`, `hz` | `ez`  |
+| `--probe-freq <HZ,...>` | Comma-separated frequencies (Hz) the first probe's running DFT tracks | (disabled) |
+| `--probe-start <SECONDS>`| First probe's ignore-samples-before time (skips startup transient) | `0.0` |
+| `--probe <SPEC>`        | Add another probe: `key=value,...` (`x`, `y`, `z`, `component`, `freq` [`;`-separated for multiple], `start`) | (none) |
 | `--materials <PATH>`    | Backing file for the mmap'd material grid             | `materials.grid`     |
 | `--output <PATH>`       | Direct I/O snapshot stream path                       | `wave_trajectory.bin`|
 | `-h`, `--help`          | Print usage                                           |                      |
+
+`engine::run` has always accepted a slice of sources/probes; the
+`--source-*`/`--probe-*` flags above configure only the *first* one
+(auto-created on first use). Repeat `--source`/`--probe` to add more —
+mixing both styles (shorthand for the first, `--source`/`--probe` for
+additional ones) is well-defined, not an error. `--probe`'s `freq` uses `;`
+to separate multiple frequencies (commas are already the `key=value` pair
+separator), so quote the whole value in your shell:
+
+```sh
+./target/release/wavefront \
+    --source-x 5 --source-y 32 --source-z 32 --source-waveform sinusoid --source-freq 3e10 \
+    --source "x=59,y=32,z=32,waveform=ricker,amplitude=0.5" \
+    --probe "x=32,y=32,z=32,freq=3e10;6e10,start=1e-10" \
+    --probe "x=45,y=32,z=32,component=hz,freq=3e10"
+```
 
 ### Example
 
