@@ -457,7 +457,7 @@ pub fn run(
         .truncate(true)
         .custom_flags(O_DIRECT)
         .open(&config.output_path)?;
-    let snapshot_bytes = field_grid.blocks().len() * std::mem::size_of::<FieldBlock>();
+    let snapshot_bytes = std::mem::size_of_val(field_grid.blocks());
     let mut buffers = [
         AlignedBuffer::new(snapshot_bytes),
         AlignedBuffer::new(snapshot_bytes),
@@ -586,10 +586,8 @@ pub fn run(
     }
 
     // Drain any writes still in flight before returning.
-    for slot in pending {
-        if let Some(completion) = slot {
-            completion.wait()?;
-        }
+    for completion in pending.into_iter().flatten() {
+        completion.wait()?;
     }
 
     let elapsed = started.elapsed();

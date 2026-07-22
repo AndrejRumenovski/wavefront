@@ -20,7 +20,7 @@ jobs:
 
       - name: Install nightly toolchain
         run: |
-          rustup toolchain install nightly --profile minimal
+          rustup toolchain install nightly --profile minimal --component clippy
           rustup override set nightly
 
       - name: Cache cargo registry and build artifacts
@@ -32,8 +32,14 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build (release)
-        run: cargo build --release --verbose
+      - name: Clippy (deny warnings)
+        run: cargo clippy --release --all-targets --verbose -- -D warnings
+
+      - name: Build (release, including examples)
+        run: cargo build --release --examples --verbose
 
       - name: Test (release)
         run: cargo test --release --verbose
+
+      - name: Run convergence study (numerical validation)
+        run: cargo run --release --example convergence_study

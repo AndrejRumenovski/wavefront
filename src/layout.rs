@@ -26,7 +26,7 @@ use std::io;
 use std::path::Path;
 
 /// Vacuum permittivity, F/m.
-const EPS0: f32 = 8.854_187_8e-12;
+const EPS0: f32 = 8.854_188e-12;
 /// Vacuum permeability, H/m.
 const MU0: f32 = 1.256_637_1e-6;
 
@@ -59,7 +59,7 @@ pub struct GridDims {
 impl GridDims {
     pub fn new(nx: usize, ny: usize, nz: usize) -> Self {
         assert!(
-            nx % BLOCK_DIM == 0 && ny % BLOCK_DIM == 0 && nz % BLOCK_DIM == 0,
+            nx.is_multiple_of(BLOCK_DIM) && ny.is_multiple_of(BLOCK_DIM) && nz.is_multiple_of(BLOCK_DIM),
             "grid dimensions must be multiples of BLOCK_DIM ({BLOCK_DIM}) so the field grid \
              tiles exactly with no partial edge blocks"
         );
@@ -893,6 +893,6 @@ mod tests {
         let dims = GridDims::new(32, 16, 8);
         assert_eq!(dims.voxel_count(), 32 * 16 * 8);
         assert_eq!(dims.block_dims(), (4, 2, 1));
-        assert_eq!(dims.block_count(), 4 * 2 * 1);
+        assert_eq!(dims.block_count(), 4 * 2); // block_dims() above: 4 * 2 * 1
     }
 }

@@ -266,7 +266,10 @@ pub fn update_h_field(
 /// that isn't part of this block's PML shell makes that axis's correction
 /// an exact no-op, which is how corner/edge blocks touching more than one
 /// face are handled without any special-casing here.
-#[allow(clippy::too_many_arguments)]
+// `lz`/`ly` below double as both the `pml_z`/`pml_y` index and an argument
+// to `FieldBlock::local_index`, so clippy's `needless_range_loop` (which
+// only sees the first use) doesn't apply cleanly here.
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 pub fn update_h_field_pml(
     center: &mut FieldBlock,
     nbrs: HUpdateNeighbors,
@@ -429,7 +432,8 @@ pub fn update_e_field(
 /// stretched-coordinate correction runs through [`pml_correct_x`] /
 /// [`pml_correct_scalar`] using `aux`'s psi memory before entering the
 /// curl.
-#[allow(clippy::too_many_arguments)]
+// See `update_h_field_pml` on why `needless_range_loop` doesn't apply here.
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 pub fn update_e_field_pml(
     center: &mut FieldBlock,
     nbrs: EUpdateNeighbors,

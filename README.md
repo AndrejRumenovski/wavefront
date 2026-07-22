@@ -5,6 +5,12 @@ electromagnetic simulator. Solves Maxwell's curl equations on a dense
 voxelized material grid (up to ~200 GB, mmap-backed, larger than physical
 RAM), on a single Linux workstation.
 
+**[VALIDATION.md](VALIDATION.md)** measures the solver's numerical
+dispersion against the Yee scheme's own exact closed-form prediction and
+confirms second-order convergence (measured order 2.16 vs. theoretical
+2.0) — the evidence that this is a numerically correct FDTD implementation,
+not just code that produces plausible-looking output.
+
 - Material grid: a flat, disk-resident byte array, one byte per voxel,
   memory-mapped via `memmap2` (`src/layout.rs`).
 - Field grid: `Ex/Ey/Ez/Hx/Hy/Hz`, tiled into `#[repr(align(64))]`
@@ -202,3 +208,22 @@ environment.
 CI (`.github/workflows/ci.yml`) builds and tests on nightly with the same
 `RUSTFLAGS` as local development, on every push to `main` and every pull
 request.
+
+## Validation
+
+`examples/convergence_study.rs` is a separate, deeper correctness check: it
+measures the solver's numerical phase velocity against the Yee scheme's own
+exact closed-form dispersion relation at four grid resolutions, using the
+same field-update kernels the production engine calls. See
+**[VALIDATION.md](VALIDATION.md)** for the methodology and results.
+
+```sh
+RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
+    cargo +nightly run --release --example convergence_study
+python3 validation/plot_convergence.py   # regenerates validation/convergence.png
+```
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
