@@ -10,11 +10,13 @@
 //!   exchange, and the `io_uring` snapshot writer.
 //! - `scene`: plain-text material structure description format.
 //! - `source`: time-domain source excitation.
+//! - `probe`: running-DFT frequency-domain response extraction.
 
 #![feature(portable_simd)]
 
 pub mod engine;
 pub mod fdtd;
 pub mod layout;
+pub mod probe;
 pub mod scene;
 pub mod source;

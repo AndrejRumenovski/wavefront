@@ -35,6 +35,11 @@ FDTD implementation, not just code that produces plausible-looking output.
   timestep with a configurable time-domain waveform (Gaussian pulse,
   sinusoid, or Ricker wavelet) -- not just a one-shot initial condition
   (`src/source.rs`).
+- Frequency-domain probes: a point probe accumulates a running discrete
+  Fourier transform (DFT) at one or more frequencies while the simulation
+  runs, so a driven-sinusoid run can report steady-state amplitude/phase
+  response (resonance, transmission) directly, without streaming and
+  post-processing the full time-domain snapshot history (`src/probe.rs`).
 - Geometry: structures can be described in a small plain-text scene format
   (spheres and boxes tagged with material constants) and voxelized into the
   material grid, instead of only the hardcoded demo sphere (`src/scene.rs`).
@@ -119,6 +124,10 @@ re-injected every timestep.
 | `--source-waveform <W>` | `gaussian`, `sinusoid`, or `ricker`                   | `ricker`             |
 | `--source-freq <HZ>`    | Source drive frequency                                | `1 / (20 * dt)`      |
 | `--source-amplitude <A>`| Source peak amplitude                                 | `1.0`                |
+| `--probe-x/-y/-z <N>`   | Probe voxel position -- all three required together with `--probe-freq` to enable the probe | (disabled) |
+| `--probe-component <C>` | Field component the probe tracks: `ex`, `ey`, `ez`, `hx`, `hy`, `hz` | `ez`  |
+| `--probe-freq <HZ,...>` | Comma-separated frequencies (Hz) the probe's running DFT tracks | (disabled) |
+| `--probe-start <SECONDS>`| Simulation time before which the probe ignores samples (skips startup transient) | `0.0` |
 | `--materials <PATH>`    | Backing file for the mmap'd material grid             | `materials.grid`     |
 | `--output <PATH>`       | Direct I/O snapshot stream path                       | `wave_trajectory.bin`|
 | `-h`, `--help`          | Print usage                                           |                      |
@@ -137,6 +146,21 @@ re-injected every timestep.
 `materials.grid` and `wave_trajectory.bin` are working files generated at
 run time (see `.gitignore`) — point `--materials`/`--output` at your NVMe
 mount for large grids rather than leaving the defaults in the repo checkout.
+
+Add `--probe-x/-y/-z`, `--probe-freq`, and (optionally) `--probe-start` to
+get a frequency-domain readout printed after the run, instead of only the
+raw time-domain snapshot stream:
+
+```sh
+./target/release/wavefront --source-waveform sinusoid --source-freq 3e10 \
+    --probe-x 42 --probe-y 32 --probe-z 32 \
+    --probe-freq 3e10 --probe-start 2e-10
+```
+
+```
+wavefront: probe (42, 32, 32) Ez frequency response:
+  3.0000e10 Hz: amplitude 3.513664e-2, phase -0.1586 rad
+```
 
 ### Scene format
 
@@ -199,7 +223,8 @@ RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
 
 Covers: fixed-point round-tripping, material/PML coefficient formulas
 against their closed forms, Yee kernel invariants (a uniform field has zero
-curl and is left unchanged), scene parsing, source waveform shapes, and an
+curl and is left unchanged), scene parsing, source waveform shapes, DFT
+probe amplitude/phase recovery against a known synthetic sinusoid, and an
 end-to-end numerical check that a point source in vacuum radiates outward
 at approximately the speed of light. The propagation-speed test calls the
 per-slab solver directly rather than going through `engine::run`, so it has

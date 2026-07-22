@@ -40,6 +40,7 @@ use crate::layout::{
     CoeffGrid, FieldBlock, FieldGrid, MaterialCoeffs, PmlAux, PmlAuxGrid, PmlContext,
     VOXELS_PER_BLOCK,
 };
+use crate::probe::Probe;
 use crate::source::Source;
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
@@ -465,6 +466,7 @@ pub fn run(
     pml: Option<&PmlContext>,
     pml_aux: &mut PmlAuxGrid,
     sources: &[Source],
+    probes: &mut [Probe],
     config: &EngineConfig,
 ) -> io::Result<()> {
     let dims = field_grid.dims();
@@ -652,6 +654,16 @@ pub fn run(
         let t = (step as f32 + 1.0) * config.dt;
         for source in sources {
             source.inject(field_grid, t);
+        }
+
+        // ---- probe accumulation -------------------------------------------
+        //
+        // Same cost profile as source injection above: each probe only ever
+        // reads the single voxel it lives at, so this stays cheap regardless
+        // of grid size. Reads the same post-E-update field state the sources
+        // just finished writing into, at the same `t`.
+        for probe in probes.iter_mut() {
+            probe.accumulate(field_grid, t);
         }
 
         if step % config.snapshot_every == 0 {

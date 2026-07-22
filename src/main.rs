@@ -15,6 +15,7 @@ use wavefront::layout::{
     CoeffGrid, FieldGrid, GridDims, MaterialGrid, MaterialId, MaterialTable, PmlConfig,
     PmlContext, BLOCK_DIM,
 };
+use wavefront::probe::{self, Probe};
 use wavefront::source::{FieldComponent, Source, Waveform};
 use wavefront::{engine, scene};
 use std::path::PathBuf;
@@ -48,6 +49,18 @@ struct Config {
     /// samples per period) if unset.
     source_freq: Option<f32>,
     source_amplitude: f32,
+    /// Probe voxel position; unset (all three unset) disables the probe
+    /// entirely. All three or none must be given together.
+    probe_pos: (Option<usize>, Option<usize>, Option<usize>),
+    probe_component: probe::FieldComponent,
+    /// Frequencies (Hz) the probe's running DFT tracks; empty disables the
+    /// probe. Required together with `probe_pos` to enable one.
+    probe_freqs: Vec<f32>,
+    /// Simulation time (seconds) before which the probe's accumulators
+    /// ignore samples, so a source's startup transient doesn't contaminate
+    /// a frequency response that's only meaningful once the field has
+    /// settled.
+    probe_start: f32,
     materials_path: PathBuf,
     output_path: PathBuf,
 }
@@ -79,6 +92,10 @@ impl Default for Config {
             source_waveform: WaveformKind::Ricker,
             source_freq: None,
             source_amplitude: 1.0,
+            probe_pos: (None, None, None),
+            probe_component: probe::FieldComponent::Ez,
+            probe_freqs: Vec::new(),
+            probe_start: 0.0,
             materials_path: PathBuf::from("materials.grid"),
             output_path: PathBuf::from("wave_trajectory.bin"),
         }
@@ -104,6 +121,10 @@ fn print_usage() {
          \x20   --source-waveform <W>  gaussian, sinusoid, or ricker [default: ricker]\n\
          \x20   --source-freq <HZ>     source drive frequency [default: 1/(20*dt)]\n\
          \x20   --source-amplitude <A> source peak amplitude [default: 1.0]\n\
+         \x20   --probe-x/-y/-z <N>    probe voxel position; enables the probe together with --probe-freq\n\
+         \x20   --probe-component <C>  field component the probe tracks: ex, ey, ez, hx, hy, hz [default: ez]\n\
+         \x20   --probe-freq <HZ,...>  comma-separated frequencies (Hz) the probe's running DFT tracks\n\
+         \x20   --probe-start <SECONDS> simulation time before which the probe ignores samples [default: 0.0]\n\
          \x20   --materials <PATH>     backing file for the mmap'd material grid [default: materials.grid]\n\
          \x20   --output <PATH>        Direct I/O snapshot stream path [default: wave_trajectory.bin]\n\
          \x20   -h, --help             print this message"
@@ -170,6 +191,35 @@ fn parse_args() -> Result<Config, String> {
             "--source-freq" => config.source_freq = Some(parse_float("--source-freq", next_value("--source-freq")?)?),
             "--source-amplitude" => {
                 config.source_amplitude = parse_float("--source-amplitude", next_value("--source-amplitude")?)?
+            }
+            "--probe-x" => config.probe_pos.0 = Some(parse_num("--probe-x", next_value("--probe-x")?)?),
+            "--probe-y" => config.probe_pos.1 = Some(parse_num("--probe-y", next_value("--probe-y")?)?),
+            "--probe-z" => config.probe_pos.2 = Some(parse_num("--probe-z", next_value("--probe-z")?)?),
+            "--probe-component" => {
+                let v = next_value("--probe-component")?;
+                config.probe_component = match v.as_str() {
+                    "ex" => probe::FieldComponent::Ex,
+                    "ey" => probe::FieldComponent::Ey,
+                    "ez" => probe::FieldComponent::Ez,
+                    "hx" => probe::FieldComponent::Hx,
+                    "hy" => probe::FieldComponent::Hy,
+                    "hz" => probe::FieldComponent::Hz,
+                    other => {
+                        return Err(format!(
+                            "invalid --probe-component: {other} (expected ex, ey, ez, hx, hy, or hz)"
+                        ))
+                    }
+                };
+            }
+            "--probe-freq" => {
+                let v = next_value("--probe-freq")?;
+                config.probe_freqs = v
+                    .split(',')
+                    .map(|s| parse_float("--probe-freq", s.to_string()))
+                    .collect::<Result<Vec<f32>, String>>()?;
+            }
+            "--probe-start" => {
+                config.probe_start = parse_float("--probe-start", next_value("--probe-start")?)?
             }
             "--materials" => config.materials_path = PathBuf::from(next_value("--materials")?),
             "--output" => config.output_path = PathBuf::from(next_value("--output")?),
@@ -249,6 +299,44 @@ fn build_source(config: &Config, dims: GridDims) -> Source {
     }
 }
 
+/// Builds the configured [`Probe`] from CLI options, if `--probe-x/-y/-z`
+/// and `--probe-freq` were both given (all-or-nothing: a partial
+/// specification -- e.g. a position with no frequency -- is a usage error,
+/// not silently ignored).
+fn build_probe(config: &Config, dims: GridDims) -> Result<Option<Probe>, String> {
+    let (px, py, pz) = config.probe_pos;
+    let has_pos = px.is_some() || py.is_some() || pz.is_some();
+    let has_freq = !config.probe_freqs.is_empty();
+
+    if !has_pos && !has_freq {
+        return Ok(None);
+    }
+    let (Some(x), Some(y), Some(z)) = (px, py, pz) else {
+        return Err(
+            "--probe-x, --probe-y, and --probe-z must all be given together to enable a probe"
+                .to_string(),
+        );
+    };
+    if !has_freq {
+        return Err("--probe-freq is required (comma-separated Hz values) to enable a probe".to_string());
+    }
+    if x >= dims.nx || y >= dims.ny || z >= dims.nz {
+        return Err(format!(
+            "probe position ({x}, {y}, {z}) is outside the {}x{}x{} domain",
+            dims.nx, dims.ny, dims.nz
+        ));
+    }
+
+    Ok(Some(Probe::new(
+        x,
+        y,
+        z,
+        config.probe_component,
+        config.probe_freqs.clone(),
+        config.probe_start,
+    )))
+}
+
 fn run(config: Config) -> Result<(), String> {
     let dims = GridDims::new(config.nx, config.ny, config.nz);
 
@@ -293,6 +381,17 @@ fn run(config: Config) -> Result<(), String> {
         source.x, source.y, source.z, source.component, source.waveform
     );
 
+    let mut probes: Vec<Probe> = build_probe(&config, dims)?.into_iter().collect();
+    if let Some(probe) = probes.first() {
+        let (x, y, z) = probe.position();
+        eprintln!(
+            "wavefront: probe at ({x}, {y}, {z}) tracking {:?} at {} frequency(s), recording from t={}s",
+            probe.component(),
+            config.probe_freqs.len(),
+            config.probe_start
+        );
+    }
+
     let pml_config = PmlConfig {
         thickness: config.pml_thickness,
         ..PmlConfig::default()
@@ -313,9 +412,23 @@ fn run(config: Config) -> Result<(), String> {
         pml_context_ref,
         &mut pml_aux_grid,
         &[source],
+        &mut probes,
         &engine_config,
     )
-    .map_err(|e| format!("simulation run failed: {e}"))
+    .map_err(|e| format!("simulation run failed: {e}"))?;
+
+    for probe in &probes {
+        let (x, y, z) = probe.position();
+        eprintln!("wavefront: probe ({x}, {y}, {z}) {:?} frequency response:", probe.component());
+        for response in probe.spectrum() {
+            eprintln!(
+                "  {:.4e} Hz: amplitude {:.6e}, phase {:.4} rad",
+                response.freq_hz, response.amplitude, response.phase_rad
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn main() -> ExitCode {
