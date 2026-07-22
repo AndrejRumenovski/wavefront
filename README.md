@@ -279,6 +279,22 @@ RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
 python3 validation/plot_pml_reflection.py   # regenerates validation/pml_reflection.png
 ```
 
+## Performance
+
+**[PERFORMANCE.md](PERFORMANCE.md)** confirms the AVX2 vectorization is
+genuinely being emitted (not silently falling back to scalar, verified by
+disassembling the release binary) and measures thread scaling and
+`O_DIRECT` snapshot-writer throughput — including a real, counterintuitive
+finding: on the machine tested, more `rayon` threads can make the solver
+*slower*, traced to the halo-exchange design's per-boundary allocation cost
+rather than core count or fundamental memory bandwidth.
+
+```sh
+benchmarks/thread_scaling.sh /path/on/a/real/disk
+python3 benchmarks/plot_thread_scaling.py   # regenerates benchmarks/thread_scaling.png
+benchmarks/snapshot_throughput.sh /path/on/a/real/disk
+```
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
