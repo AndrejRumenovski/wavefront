@@ -58,7 +58,6 @@ lto = true
 memmap2 = "=0.9.4"
 rio = "=0.9.4"
 rayon = "=1.10.0"
-crossbeam-channel = "=0.5.16"
 
 # Pinned to exact versions (per the mandate above) so a release build is
 # fully reproducible across machines. Bump deliberately, not via `cargo

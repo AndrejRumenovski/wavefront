@@ -58,7 +58,7 @@ def main():
     ax.set_xlabel("rayon threads", color=TEXT_COLOR, fontsize=11)
     ax.set_ylabel("steps/s", color=TEXT_COLOR, fontsize=11)
     ax.set_title(
-        "Thread scaling: halo-exchange plane size dominates, not core count",
+        "Post-fix: both domain shapes now scale similarly with threads",
         color=TEXT_COLOR, fontsize=12, pad=12,
     )
     ax.set_ylim(bottom=0)

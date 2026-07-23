@@ -1,7 +1,7 @@
 //! Macro-scale execution engine: spatial domain decomposition across
-//! rayon-scheduled worker threads, lock-free `crossbeam-channel` boundary
-//! exchange between them, and an `io_uring`-backed, double-buffered Direct
-//! I/O snapshot writer.
+//! rayon-scheduled worker threads, direct cross-slab halo reads between
+//! them, and an `io_uring`-backed, double-buffered Direct I/O snapshot
+//! writer.
 //!
 //! ## Domain decomposition
 //!
@@ -16,13 +16,29 @@
 //!
 //! A slab's own Yee stencil is self-sufficient in X and Y (each slab spans
 //! the full X/Y extent of the grid), but at its Z boundary it needs one
-//! plane of field data that belongs to the *neighboring* slab -- which a
-//! different thread may be concurrently mutating. Reaching across into
-//! another thread's slice would be a data race, so instead each slab
-//! publishes its own boundary plane and receives its neighbor's over a pair
-//! of bounded, lock-free `crossbeam_channel` ring channels, once per
-//! timestep, per boundary. This is the same halo-exchange pattern used in
-//! MPI-decomposed FDTD codes, adapted to threads.
+//! plane of field data that belongs to the *neighboring* slab. An earlier
+//! version of this engine treated that as "a different thread may be
+//! concurrently mutating it, so reaching across is a data race" and routed
+//! every boundary plane through a cloned, heap-allocated
+//! `crossbeam_channel` message every phase, every step -- safe, but a real
+//! performance problem (`PERFORMANCE.md`'s thread-scaling section measured
+//! this costing enough bandwidth to make *more threads slower*, not
+//! faster, on cube-shaped domains).
+//!
+//! The premise was too conservative: within a single phase (the H-update or
+//! the E-update), every slab's closure writes only ONE field type of its
+//! OWN blocks (H during the H-phase, E during the E-phase) and reads only
+//! the OTHER field type, off itself and its neighbors. Two concurrently
+//! running closures therefore never access the same memory location with
+//! at least one write -- one thread's `Hx/Hy/Hz` writes and another
+//! thread's `Ex/Ey/Ez` reads land in disjoint array fields of the same
+//! `FieldBlock`, which is exactly the reasoning [`update_slab_h`] and
+//! [`update_slab_e`] already rely on for *intra*-slab neighbor access (see
+//! their own `SAFETY` comments). [`CrossSlabPtr`] extends that same
+//! argument across the `par_chunks_mut` boundary: each slab reads its
+//! neighbor's already-settled boundary plane directly, through a raw
+//! pointer into the single shared backing allocation, with no clone, no
+//! allocation, and no channel at all.
 //!
 //! ## Out-of-core snapshot streaming
 //!
@@ -42,7 +58,6 @@ use crate::layout::{
 };
 use crate::probe::Probe;
 use crate::source::Source;
-use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::fs::OpenOptions;
@@ -68,6 +83,32 @@ use std::time::Instant;
 static OUTER_ZERO_BLOCK: FieldBlock = FieldBlock::ZERO;
 
 // =============================================================================
+// CROSS-SLAB HALO ACCESS
+// =============================================================================
+
+/// A raw pointer to the whole per-step block array, captured once before
+/// [`run`] partitions it into per-thread slabs via `par_chunks_mut`, so each
+/// slab's closure can read a neighboring slab's boundary plane directly
+/// instead of paying for a clone-and-channel round trip -- see this module's
+/// "Cross-slab boundaries" docs for why that's sound.
+///
+/// Deliberately holds only the raw pointer, not a length or a lifetime: the
+/// slice each call site actually constructs from it is always bounds-derived
+/// from `blocks_per_slab`/`plane`/`num_slabs` at the call site, not from
+/// anything carried on this type.
+#[derive(Clone, Copy)]
+struct CrossSlabPtr(*mut FieldBlock);
+
+// SAFETY: sharing this pointer across threads is sound because every
+// dereference of it (see `run`'s H-update/E-update closures) only ever reads
+// a memory region that no concurrently-running closure in the same phase
+// ever writes -- see this module's "Cross-slab boundaries" docs and
+// `update_slab_h`/`update_slab_e`'s own `SAFETY` comments for the underlying
+// disjoint-field-array argument this relies on.
+unsafe impl Send for CrossSlabPtr {}
+unsafe impl Sync for CrossSlabPtr {}
+
+// =============================================================================
 // PER-SLAB YEE UPDATE
 // =============================================================================
 
@@ -76,9 +117,9 @@ static OUTER_ZERO_BLOCK: FieldBlock = FieldBlock::ZERO;
 /// `slab` is a contiguous, disjoint sub-slice of the global block array
 /// covering full XY planes for local Z range `0..bz_n`; `coeffs` is the
 /// matching slice of precomputed per-voxel coefficients; `plus_z_halo` is
-/// the bottom E-plane of the *next* slab up (received over a
-/// `crossbeam_channel`), used as the `+Z` neighbor for this slab's own top
-/// plane.
+/// the bottom E-plane of the *next* slab up (read directly out of the
+/// shared backing allocation via [`CrossSlabPtr`] -- see [`run`]), used as
+/// the `+Z` neighbor for this slab's own top plane.
 ///
 /// `pml` is `None` when the PML is disabled entirely; otherwise it carries
 /// the three per-axis coefficient profiles, and `pml_aux_slab` is the
@@ -164,8 +205,9 @@ fn update_slab_h(
 
 /// Advances the E field for every block in one slab. Mirror image of
 /// [`update_slab_h`]: reads `-X`/`-Y`/`-Z` neighbors, with `minus_z_halo`
-/// the top H-plane of the *previous* slab down. See [`update_slab_h`] for
-/// the `pml`/`pml_aux_slab`/`bz_offset` parameters.
+/// the top H-plane of the *previous* slab down (same [`CrossSlabPtr`]
+/// direct-read mechanism). See [`update_slab_h`] for the
+/// `pml`/`pml_aux_slab`/`bz_offset` parameters.
 #[allow(clippy::too_many_arguments)]
 fn update_slab_e(
     slab: &mut [FieldBlock],
@@ -230,6 +272,153 @@ fn update_slab_e(
             }
         }
     }
+}
+
+/// Advances the whole domain by one full H-then-E timestep: fans the H
+/// update out across slabs by rayon, then (once every slab's H update has
+/// finished -- `for_each` blocks the calling thread until all its work
+/// completes) does the same for the E update. Cross-slab halo data is read
+/// directly out of the shared backing allocation via [`CrossSlabPtr`] (see
+/// this module's "Cross-slab boundaries" docs); `zero_plane` is the
+/// zero-field boundary condition for the domain's own outer Z faces.
+///
+/// Factored out of [`run`] so it can be exercised directly by tests without
+/// pulling in `run`'s `O_DIRECT` snapshot writer, source injection, or probe
+/// accumulation -- this crate's test suite deliberately avoids `O_DIRECT`
+/// dependencies, since a CI sandbox may not support Direct I/O (see
+/// `wave_propagates_at_approximately_speed_of_light`'s doc comment).
+#[allow(clippy::too_many_arguments)]
+fn step_all_slabs(
+    field_grid: &mut FieldGrid,
+    coeff_grid: &CoeffGrid,
+    pml: Option<&PmlContext>,
+    pml_aux: &mut PmlAuxGrid,
+    zero_plane: &[FieldBlock],
+    bx_n: usize,
+    by_n: usize,
+    plane: usize,
+    blocks_per_slab: usize,
+    rows_per_slab: usize,
+    num_slabs: usize,
+) {
+    let all_blocks = field_grid.blocks_mut();
+    let all_coeffs = coeff_grid.blocks();
+    let all_pml_aux = pml_aux.blocks_mut();
+    // Captured before `all_blocks` is partitioned by `par_chunks_mut`
+    // below -- see `CrossSlabPtr` and this module's "Cross-slab
+    // boundaries" docs for why concurrent cross-slab reads through it,
+    // from the closures below, are race-free.
+    let all_blocks_ptr = CrossSlabPtr(all_blocks.as_mut_ptr());
+
+    // ---- H update phase, fanned out across slabs by rayon ----------
+    all_blocks
+        .par_chunks_mut(blocks_per_slab)
+        .zip(all_coeffs.par_chunks(blocks_per_slab))
+        .zip(all_pml_aux.par_chunks_mut(blocks_per_slab))
+        .enumerate()
+        .for_each(|(i, ((slab, slab_coeffs), slab_pml_aux))| {
+            // Rust 2021's disjoint closure capture would otherwise
+            // capture only the `.0` field (a bare `*mut FieldBlock`,
+            // which isn't `Sync`) instead of the whole `CrossSlabPtr`
+            // (which has the `unsafe impl Sync` this relies on) --
+            // this shadow forces a whole-value capture. Not actually
+            // redundant, despite how it looks to clippy.
+            #[allow(clippy::redundant_locals)]
+            let all_blocks_ptr = all_blocks_ptr;
+            let bz_n = slab.len() / plane;
+            let bz_offset = i * rows_per_slab;
+
+            let plus_z_halo: &[FieldBlock] = if i + 1 < num_slabs {
+                // SAFETY: slab `i+1` starts at flat block index
+                // `(i+1)*blocks_per_slab` and always has at least
+                // `plane` elements regardless of whether it's the last
+                // slab (every slab has at least one full Z-row of
+                // blocks, by construction of `rows_per_slab`/
+                // `num_slabs`), so this plane is fully in-bounds of the
+                // single `bx_n*by_n*bz_n_total`-element backing
+                // allocation `all_blocks_ptr` points into. No closure in
+                // this `for_each` call -- including slab `i+1`'s own,
+                // which may be running concurrently on another thread
+                // right now -- ever writes `Ex/Ey/Ez` during this
+                // H-update phase (every closure only ever writes its own
+                // slab's `Hx/Hy/Hz`), so this shared read can never race
+                // with a concurrent write, regardless of scheduling
+                // order between the two closures.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        all_blocks_ptr.0.add((i + 1) * blocks_per_slab),
+                        plane,
+                    )
+                }
+            } else {
+                zero_plane
+            };
+
+            update_slab_h(
+                slab,
+                slab_coeffs,
+                slab_pml_aux,
+                pml,
+                bx_n,
+                by_n,
+                bz_n,
+                bz_offset,
+                plus_z_halo,
+            );
+        });
+
+    // ---- E update phase, fanned out across slabs by rayon ----------
+    all_blocks
+        .par_chunks_mut(blocks_per_slab)
+        .zip(all_coeffs.par_chunks(blocks_per_slab))
+        .zip(all_pml_aux.par_chunks_mut(blocks_per_slab))
+        .enumerate()
+        .for_each(|(i, ((slab, slab_coeffs), slab_pml_aux))| {
+            // See the matching comment in the H-update closure above.
+            #[allow(clippy::redundant_locals)]
+            let all_blocks_ptr = all_blocks_ptr;
+            let bz_n = slab.len() / plane;
+            let bz_offset = i * rows_per_slab;
+
+            let minus_z_halo: &[FieldBlock] = if i > 0 {
+                // SAFETY: mirror image of the H-phase read above. Slab
+                // `i-1` is never the last slab when `i > 0` (its own
+                // existence as slab `i`'s predecessor guarantees
+                // `i-1 < num_slabs-1`), so it always has exactly
+                // `blocks_per_slab` elements (`blocks_per_slab >=
+                // plane` always, since `blocks_per_slab =
+                // rows_per_slab*plane` and `rows_per_slab >= 1`, so this
+                // subtraction cannot underflow); its last `plane` of
+                // them -- starting at flat index
+                // `(i-1)*blocks_per_slab + (blocks_per_slab-plane) ==
+                // i*blocks_per_slab - plane` -- are therefore fully
+                // in-bounds. No closure in this `for_each` call ever
+                // writes `Hx/Hy/Hz` during this E-update phase (every
+                // closure only ever writes its own slab's `Ex/Ey/Ez`),
+                // so this shared read can never race with a concurrent
+                // write.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        all_blocks_ptr.0.add(i * blocks_per_slab - plane),
+                        plane,
+                    )
+                }
+            } else {
+                zero_plane
+            };
+
+            update_slab_e(
+                slab,
+                slab_coeffs,
+                slab_pml_aux,
+                pml,
+                bx_n,
+                by_n,
+                bz_n,
+                bz_offset,
+                minus_z_halo,
+            );
+        });
 }
 
 // =============================================================================
@@ -451,9 +640,10 @@ fn serialize_snapshot(grid: &FieldGrid, out: &mut [u8]) {
 }
 
 /// Runs the full explicit timestep loop: alternating H/E Yee updates across
-/// rayon-scheduled Z-slabs with crossbeam-channel halo exchange at slab
-/// boundaries, periodically streaming a field snapshot out via `rio`
-/// double-buffered `O_DIRECT` writes.
+/// rayon-scheduled Z-slabs with direct cross-slab halo reads (see this
+/// module's "Cross-slab boundaries" docs) at slab boundaries, periodically
+/// streaming a field snapshot out via `rio` double-buffered `O_DIRECT`
+/// writes.
 ///
 /// `pml` is `None` to disable the absorbing boundary entirely (falling back
 /// to the zero-field `OUTER_ZERO_BLOCK` termination at every domain face);
@@ -478,24 +668,12 @@ pub fn run(
     let blocks_per_slab = rows_per_slab * plane;
     let num_slabs = bz_n_total.div_ceil(rows_per_slab);
 
-    // One pair of bounded(1) rendezvous channels per internal boundary --
-    // lock-free ring channels connecting exactly two fixed thread domains,
-    // alive for the whole run. `e_*` carries E-plane data flowing downward
-    // (slab i+1 -> slab i, consumed before the H update); `h_*` carries
-    // H-plane data flowing upward (slab i -> slab i+1, consumed before the
-    // E update).
-    let mut e_tx = Vec::with_capacity(num_slabs.saturating_sub(1));
-    let mut e_rx = Vec::with_capacity(num_slabs.saturating_sub(1));
-    let mut h_tx = Vec::with_capacity(num_slabs.saturating_sub(1));
-    let mut h_rx = Vec::with_capacity(num_slabs.saturating_sub(1));
-    for _ in 0..num_slabs.saturating_sub(1) {
-        let (tx, rx) = bounded::<Box<[FieldBlock]>>(1);
-        e_tx.push(tx);
-        e_rx.push(rx);
-        let (tx, rx) = bounded::<Box<[FieldBlock]>>(1);
-        h_tx.push(tx);
-        h_rx.push(rx);
-    }
+    // The boundary condition for the domain's own outer Z faces (the first
+    // slab's `-Z` side, the last slab's `+Z` side) -- a full plane's worth of
+    // zero blocks, built once and shared by reference every step rather than
+    // reallocated per step (`plane` is only known at runtime, so this can't
+    // be a `static` the way the single-block `OUTER_ZERO_BLOCK` is).
+    let zero_plane: Vec<FieldBlock> = vec![FieldBlock::ZERO; plane];
 
     // ---- io_uring double-buffered O_DIRECT snapshot writer ----------------
     //
@@ -567,82 +745,19 @@ pub fn run(
     let started = Instant::now();
 
     for step in 0..config.num_steps {
-        let all_blocks = field_grid.blocks_mut();
-        let all_coeffs = coeff_grid.blocks();
-        let all_pml_aux = pml_aux.blocks_mut();
-
-        // ---- H update phase, fanned out across slabs by rayon ----------
-        all_blocks
-            .par_chunks_mut(blocks_per_slab)
-            .zip(all_coeffs.par_chunks(blocks_per_slab))
-            .zip(all_pml_aux.par_chunks_mut(blocks_per_slab))
-            .enumerate()
-            .for_each(|(i, ((slab, slab_coeffs), slab_pml_aux))| {
-                let bz_n = slab.len() / plane;
-                let bz_offset = i * rows_per_slab;
-
-                let plus_z_halo: Box<[FieldBlock]> = if i + 1 < num_slabs {
-                    e_rx[i].recv().expect("adjacent slab's channel half was dropped")
-                } else {
-                    vec![FieldBlock::ZERO; plane].into_boxed_slice()
-                };
-
-                update_slab_h(
-                    slab,
-                    slab_coeffs,
-                    slab_pml_aux,
-                    pml,
-                    bx_n,
-                    by_n,
-                    bz_n,
-                    bz_offset,
-                    &plus_z_halo,
-                );
-
-                if i > 0 {
-                    let bottom_plane: Box<[FieldBlock]> = slab[..plane].to_vec().into_boxed_slice();
-                    e_tx[i - 1]
-                        .send(bottom_plane)
-                        .expect("adjacent slab's channel half was dropped");
-                }
-            });
-
-        // ---- E update phase, fanned out across slabs by rayon ----------
-        all_blocks
-            .par_chunks_mut(blocks_per_slab)
-            .zip(all_coeffs.par_chunks(blocks_per_slab))
-            .zip(all_pml_aux.par_chunks_mut(blocks_per_slab))
-            .enumerate()
-            .for_each(|(i, ((slab, slab_coeffs), slab_pml_aux))| {
-                let bz_n = slab.len() / plane;
-                let bz_offset = i * rows_per_slab;
-
-                let minus_z_halo: Box<[FieldBlock]> = if i > 0 {
-                    h_rx[i - 1].recv().expect("adjacent slab's channel half was dropped")
-                } else {
-                    vec![FieldBlock::ZERO; plane].into_boxed_slice()
-                };
-
-                update_slab_e(
-                    slab,
-                    slab_coeffs,
-                    slab_pml_aux,
-                    pml,
-                    bx_n,
-                    by_n,
-                    bz_n,
-                    bz_offset,
-                    &minus_z_halo,
-                );
-
-                if i + 1 < num_slabs {
-                    let top_plane: Box<[FieldBlock]> =
-                        slab[slab.len() - plane..].to_vec().into_boxed_slice();
-                    h_tx[i]
-                        .send(top_plane)
-                        .expect("adjacent slab's channel half was dropped");
-                }
-            });
+        step_all_slabs(
+            field_grid,
+            coeff_grid,
+            pml,
+            pml_aux,
+            &zero_plane,
+            bx_n,
+            by_n,
+            plane,
+            blocks_per_slab,
+            rows_per_slab,
+            num_slabs,
+        );
 
         // ---- source injection --------------------------------------------
         //
@@ -864,6 +979,122 @@ mod tests {
             reassembled,
             buf.as_ref().to_vec(),
             "concatenated chunks must reproduce the original buffer byte-for-byte, in order"
+        );
+    }
+
+    /// Runs `step_all_slabs` for a few timesteps on an identical domain,
+    /// source, and starting state, once forced onto a single-thread pool
+    /// (`num_slabs == 1`, no cross-slab halo reads at all) and once forced
+    /// onto a multi-thread pool sized so `num_slabs > 1` -- exercising the
+    /// `CrossSlabPtr` cross-slab read path this test module didn't cover
+    /// before (`wave_propagates_at_approximately_speed_of_light` above only
+    /// ever calls `update_slab_h`/`update_slab_e` directly with the whole
+    /// domain as one slab).
+    ///
+    /// Domain decomposition is purely a scheduling detail: each voxel's Yee
+    /// update reads specific neighbor values that exist regardless of which
+    /// slab they happen to live in, and applies the same fixed sequence of
+    /// floating-point operations to them either way. So this doesn't just
+    /// check "close enough" -- it asserts the two runs' final field state is
+    /// bit-for-bit identical. Any wrong offset in the cross-slab pointer
+    /// arithmetic would need to coincidentally produce exactly the same
+    /// numbers to slip past this, which is astronomically unlikely for a
+    /// real indexing bug.
+    ///
+    /// Uses `rayon::ThreadPoolBuilder::build()` (a local, non-global pool)
+    /// rather than `build_global()`, so this can't panic from double-
+    /// initializing the process-wide pool if other tests run concurrently
+    /// in the same test binary.
+    #[test]
+    fn multi_slab_decomposition_matches_single_slab_bit_for_bit() {
+        let dims = GridDims::new(64, 64, 64); // 8 Z-blocks
+        let dx = 1.0e-3_f32;
+        let dt = 1.5e-12_f32;
+        let table = MaterialTable::vacuum_filled(dt, dx);
+        let (bx_n, by_n, bz_n_total) = dims.block_dims();
+        let plane = bx_n * by_n;
+        let zero_plane = vec![FieldBlock::ZERO; plane];
+        let num_steps = 30;
+
+        let center = (dims.nx / 2, dims.ny / 2, dims.nz / 2);
+        let source = Source {
+            x: center.0,
+            y: center.1,
+            z: center.2,
+            component: FieldComponent::Ez,
+            amplitude: 1.0,
+            waveform: Waveform::RickerWavelet {
+                peak_freq_hz: 3.0e10,
+                t0: 1.0 / 3.0e10,
+            },
+        };
+
+        // Runs `num_steps` of step_all_slabs + source injection with the
+        // process's Z-block count artificially forced across `num_threads`
+        // rayon threads, and returns the final field state's raw bytes.
+        let run_with_thread_count = |num_threads: usize| -> Vec<u8> {
+            let path = std::env::temp_dir().join(format!(
+                "wavefront_test_multislab_{}_{:?}_{num_threads}.grid",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let material_grid = MaterialGrid::create(&path, dims).expect("create test material grid");
+            let coeff_grid = CoeffGrid::build(&material_grid, &table);
+            let _ = std::fs::remove_file(&path);
+
+            let mut field_grid = FieldGrid::zeroed(dims);
+            let mut pml_aux = PmlAuxGrid::build(dims, 0);
+
+            let rows_per_slab = bz_n_total.div_ceil(num_threads).max(1);
+            let blocks_per_slab = rows_per_slab * plane;
+            let num_slabs = bz_n_total.div_ceil(rows_per_slab);
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .build()
+                .expect("build local rayon thread pool");
+            pool.install(|| {
+                for step in 0..num_steps {
+                    step_all_slabs(
+                        &mut field_grid,
+                        &coeff_grid,
+                        None,
+                        &mut pml_aux,
+                        &zero_plane,
+                        bx_n,
+                        by_n,
+                        plane,
+                        blocks_per_slab,
+                        rows_per_slab,
+                        num_slabs,
+                    );
+                    let t = (step as f32 + 1.0) * dt;
+                    source.inject(&mut field_grid, t);
+                }
+            });
+
+            let mut out = vec![0u8; std::mem::size_of_val(field_grid.blocks())];
+            serialize_snapshot(&field_grid, &mut out);
+            out
+        };
+
+        let single_slab = run_with_thread_count(1);
+        let multi_slab = run_with_thread_count(4);
+
+        // Sanity check that this test actually exercises the cross-slab
+        // path at all (threads=1 always gives exactly one slab, by
+        // construction of rows_per_slab/num_slabs -- not worth asserting).
+        let multi_rows_per_slab = bz_n_total.div_ceil(4).max(1);
+        let multi_num_slabs = bz_n_total.div_ceil(multi_rows_per_slab);
+        assert!(
+            multi_num_slabs > 1,
+            "sanity: threads=4 over {bz_n_total} Z-blocks should give more than one slab, got {multi_num_slabs}"
+        );
+
+        assert_eq!(
+            single_slab, multi_slab,
+            "field state after {num_steps} steps differs between 1 slab and {multi_num_slabs} slabs -- \
+             domain decomposition must not change the computed result"
         );
     }
 }

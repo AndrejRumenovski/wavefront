@@ -20,8 +20,12 @@ FDTD implementation, not just code that produces plausible-looking output.
 - Solver: SIMD (`std::simd`) Yee-lattice curl update kernels
   (`src/fdtd.rs`).
 - Scheduling: the grid is decomposed into Z-slabs and fanned out across
-  `rayon`'s work-stealing thread pool, with `crossbeam-channel` used for
-  lock-free halo exchange across slab boundaries (`src/engine.rs`).
+  `rayon`'s work-stealing thread pool. Cross-slab boundary data is read
+  directly out of the shared backing allocation via a raw pointer
+  (`CrossSlabPtr`) rather than copied through a channel -- provably
+  race-free because each phase writes only one field type and reads only
+  the other (`src/engine.rs`; see `PERFORMANCE.md` for the measured
+  scaling impact of this over an earlier `crossbeam-channel`-based design).
 - Boundaries: a graded Convolutional PML (CPML) absorbs outgoing waves at
   each of the 6 domain faces, so the domain behaves like open space instead
   of a sealed reflective box. Its auxiliary convolution memory is only
@@ -242,12 +246,14 @@ RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
 Covers: fixed-point round-tripping, material/PML coefficient formulas
 against their closed forms, Yee kernel invariants (a uniform field has zero
 curl and is left unchanged), scene parsing, source waveform shapes, DFT
-probe amplitude/phase recovery against a known synthetic sinusoid, and an
+probe amplitude/phase recovery against a known synthetic sinusoid, an
 end-to-end numerical check that a point source in vacuum radiates outward
-at approximately the speed of light. The propagation-speed test calls the
-per-slab solver directly rather than going through `engine::run`, so it has
-no `O_DIRECT`/filesystem dependency and can't be flaky in a sandboxed CI
-environment.
+at approximately the speed of light, and that multi-slab domain
+decomposition produces bit-for-bit identical output to a single slab
+(`src/engine.rs`'s `CrossSlabPtr` cross-slab halo reads, forced onto local
+1-thread and multi-thread `rayon` pools). Neither of the last two goes
+through `engine::run`'s `O_DIRECT` snapshot writer, so they have no
+filesystem dependency and can't be flaky in a sandboxed CI environment.
 
 CI (`.github/workflows/ci.yml`) builds and tests on nightly with the same
 `RUSTFLAGS` as local development, on every push to `main` and every pull
@@ -284,14 +290,20 @@ python3 validation/plot_pml_reflection.py   # regenerates validation/pml_reflect
 **[PERFORMANCE.md](PERFORMANCE.md)** confirms the AVX2 vectorization is
 genuinely being emitted (not silently falling back to scalar, verified by
 disassembling the release binary) and measures thread scaling and
-`O_DIRECT` snapshot-writer throughput — including a real, counterintuitive
-finding: on the machine tested, more `rayon` threads can make the solver
-*slower*, traced to the halo-exchange design's per-boundary allocation cost
-rather than core count or fundamental memory bandwidth.
+`O_DIRECT` snapshot-writer throughput. It also tells the story of a real
+finding-and-fix: the original `crossbeam-channel`-based halo exchange made
+more `rayon` threads make the solver *slower* on cube-shaped domains
+(-20% at 12 threads); replacing it with direct cross-slab reads
+(`CrossSlabPtr`, `src/engine.rs`) — provably race-free by the same
+disjoint-field-array argument the per-slab kernels already relied on —
+turned that into genuine speedup instead (+25 to +34%), verified
+bit-for-bit identical to a single-slab reference.
 
 ```sh
+cargo +nightly test --release engine::             # includes the bit-for-bit multi-slab check
 benchmarks/thread_scaling.sh /path/on/a/real/disk
-python3 benchmarks/plot_thread_scaling.py   # regenerates benchmarks/thread_scaling.png
+python3 benchmarks/plot_thread_scaling.py          # regenerates benchmarks/thread_scaling.png
+python3 benchmarks/plot_halo_fix_before_after.py   # regenerates benchmarks/halo_fix_before_after.png
 benchmarks/snapshot_throughput.sh /path/on/a/real/disk
 ```
 
