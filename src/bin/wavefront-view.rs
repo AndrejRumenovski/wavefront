@@ -561,6 +561,147 @@ mod gif {
         file.write_all(&[0x3B])?; // trailer
         Ok(())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A minimal LZW *decoder* matching the GIF89a algorithm, written
+        /// independently of `lzw_encode`'s implementation -- so a bug shared
+        /// between encoder and decoder can't hide a real mismatch. Used only
+        /// to round-trip verify the encoder's output decodes back to the
+        /// original indices, the way a real GIF reader would.
+        fn lzw_decode(data: &[u8]) -> Vec<u8> {
+            assert_eq!(data[0], MIN_CODE_SIZE, "unexpected minimum code size");
+
+            let mut bitstream = Vec::new();
+            let mut i = 1;
+            loop {
+                let len = data[i] as usize;
+                i += 1;
+                if len == 0 {
+                    break;
+                }
+                bitstream.extend_from_slice(&data[i..i + len]);
+                i += len;
+            }
+
+            let mut bit_pos = 0usize;
+            let mut read_code = |width: u8| -> u16 {
+                let mut code = 0u32;
+                for b in 0..width as usize {
+                    let byte = bitstream[(bit_pos + b) / 8];
+                    let bit = (byte >> ((bit_pos + b) % 8)) & 1;
+                    code |= (bit as u32) << b;
+                }
+                bit_pos += width as usize;
+                code as u16
+            };
+
+            let mut code_width = MIN_CODE_SIZE + 1;
+            // Codes 0..256 are literal single bytes; 256/257 are Clear/End
+            // placeholders (never looked up); dynamic entries start at 258.
+            let base_dict: Vec<Vec<u8>> = (0..CLEAR_CODE)
+                .map(|b| vec![b as u8])
+                .chain([vec![], vec![]])
+                .collect();
+            let mut dict = base_dict.clone();
+            let mut out = Vec::new();
+            let mut prev: Option<Vec<u8>> = None;
+
+            loop {
+                let code = read_code(code_width);
+                if code == CLEAR_CODE {
+                    dict = base_dict.clone();
+                    code_width = MIN_CODE_SIZE + 1;
+                    prev = None;
+                    continue;
+                }
+                if code == END_CODE {
+                    break;
+                }
+                let entry = if (code as usize) < dict.len() {
+                    dict[code as usize].clone()
+                } else if let Some(p) = &prev {
+                    // The "KwKwK" case: a code that references the entry
+                    // about to be added this very iteration.
+                    let mut e = p.clone();
+                    e.push(p[0]);
+                    e
+                } else {
+                    panic!("invalid LZW code stream: unresolvable code {code}");
+                };
+                out.extend_from_slice(&entry);
+                if let Some(p) = &prev {
+                    let mut new_entry = p.clone();
+                    new_entry.push(entry[0]);
+                    dict.push(new_entry);
+                    // `>=`, not `>`: the decoder's table is always exactly
+                    // one entry behind the encoder's (it only learns a new
+                    // (prefix, byte) pair *after* decoding the code that
+                    // reveals the byte, whereas the encoder knows it one
+                    // iteration earlier, from the input it's compressing).
+                    // Bumping at `>` here reads the code the encoder wrote
+                    // just after its own bump using the *old*, now
+                    // one-bit-too-narrow width, corrupting every code after
+                    // it -- caught by
+                    // `lzw_round_trips_non_repeating_data_forcing_a_dictionary_reset`.
+                    if dict.len() >= (1 << code_width) && code_width < 12 {
+                        code_width += 1;
+                    }
+                }
+                prev = Some(entry);
+            }
+            out
+        }
+
+        #[test]
+        fn lzw_round_trips_uniform_data() {
+            let indices = vec![7u8; 1000];
+            assert_eq!(lzw_decode(&lzw_encode(&indices)), indices);
+        }
+
+        #[test]
+        fn lzw_round_trips_a_short_repeating_pattern() {
+            let indices: Vec<u8> = (0..2000).map(|i| (i % 4) as u8).collect();
+            assert_eq!(lzw_decode(&lzw_encode(&indices)), indices);
+        }
+
+        #[test]
+        fn lzw_round_trips_a_single_byte() {
+            let indices = vec![42u8];
+            assert_eq!(lzw_decode(&lzw_encode(&indices)), indices);
+        }
+
+        #[test]
+        fn lzw_round_trips_empty_input() {
+            let indices: Vec<u8> = vec![];
+            assert_eq!(lzw_decode(&lzw_encode(&indices)), indices);
+        }
+
+        #[test]
+        fn lzw_round_trips_non_repeating_data_forcing_a_dictionary_reset() {
+            // Enough distinct byte-pairs that the 12-bit code space (4096
+            // entries) fills up and `lzw_encode` has to emit a mid-stream
+            // Clear Code, exercising the reset path -- and, along the way,
+            // every code-width transition from 9 up through 12 bits, which
+            // is exactly where an encoder/decoder timing mismatch would
+            // first desync.
+            let indices: Vec<u8> = (0..6000u32).map(|i| ((i * 37) % 256) as u8).collect();
+            assert_eq!(lzw_decode(&lzw_encode(&indices)), indices);
+        }
+
+        #[test]
+        fn lzw_encoding_actually_compresses_repetitive_data() {
+            let indices = vec![0u8; 10_000];
+            let encoded = lzw_encode(&indices);
+            assert!(
+                encoded.len() < 200,
+                "10,000 repeated bytes should compress to well under 200 bytes, got {}",
+                encoded.len()
+            );
+        }
+    }
 }
 
 /// Builds a 256-entry palette by sampling `colormap` across the value range
@@ -732,6 +873,134 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("wavefront-view: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serializes `blocks` the same way `engine.rs::serialize_snapshot`
+    /// does (block-major, `Ex,Ey,Ez,Hx,Hy,Hz` per block) -- built
+    /// independently of this file's own `read_component`/`sample`, so a
+    /// round-trip test through it exercises the real on-disk format rather
+    /// than mirroring whatever offset math the reader happens to use.
+    fn build_snapshot_bytes(blocks: &[FieldBlock]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(std::mem::size_of_val(blocks));
+        for block in blocks {
+            for arr in [&block.ex, &block.ey, &block.ez, &block.hx, &block.hy, &block.hz] {
+                for v in arr {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    fn zero_blocks(dims: &GridDims) -> Vec<FieldBlock> {
+        let (bx_n, by_n, bz_n) = dims.block_dims();
+        vec![FieldBlock::ZERO; bx_n * by_n * bz_n]
+    }
+
+    fn set_ez(blocks: &mut [FieldBlock], dims: &GridDims, x: usize, y: usize, z: usize, value: f32) {
+        let (bx_n, by_n, _) = dims.block_dims();
+        let (bx, by, bz) = (x / BLOCK_DIM, y / BLOCK_DIM, z / BLOCK_DIM);
+        let (lx, ly, lz) = (x % BLOCK_DIM, y % BLOCK_DIM, z % BLOCK_DIM);
+        blocks[(bz * by_n + by) * bx_n + bx].ez[FieldBlock::local_index(lx, ly, lz)] = value;
+    }
+
+    #[test]
+    fn sample_reads_correct_component_and_voxel() {
+        let dims = GridDims::new(8, 8, 8); // exactly one block
+        let (bx_n, by_n, _) = dims.block_dims();
+        let mut blocks = zero_blocks(&dims);
+        blocks[0].ex[FieldBlock::local_index(3, 4, 5)] = 42.0;
+        let bytes = build_snapshot_bytes(&blocks);
+
+        assert_eq!(sample(&bytes, bx_n, by_n, 3, 4, 5, Component::Ex), 42.0);
+        assert_eq!(sample(&bytes, bx_n, by_n, 0, 0, 0, Component::Ex), 0.0);
+        assert_eq!(sample(&bytes, bx_n, by_n, 3, 4, 5, Component::Ey), 0.0);
+    }
+
+    #[test]
+    fn energy_component_sums_squares_of_all_six() {
+        let dims = GridDims::new(8, 8, 8);
+        let (bx_n, by_n, _) = dims.block_dims();
+        let mut blocks = zero_blocks(&dims);
+        let local = FieldBlock::local_index(1, 1, 1);
+        blocks[0].ex[local] = 3.0;
+        blocks[0].hz[local] = 4.0;
+        let bytes = build_snapshot_bytes(&blocks);
+
+        assert_eq!(sample(&bytes, bx_n, by_n, 1, 1, 1, Component::Energy), 25.0);
+    }
+
+    #[test]
+    fn compute_values_slice_matches_manual_placement_at_a_fixed_plane() {
+        let dims = GridDims::new(16, 16, 16); // 2x2x2 blocks
+        let mut blocks = zero_blocks(&dims);
+        set_ez(&mut blocks, &dims, 0, 0, 5, 1.0);
+        set_ez(&mut blocks, &dims, 15, 15, 5, 2.0);
+        set_ez(&mut blocks, &dims, 7, 3, 5, -3.5);
+        set_ez(&mut blocks, &dims, 10, 10, 10, 99.0); // different z: must not leak into slice 5
+        let bytes = build_snapshot_bytes(&blocks);
+
+        let (width, height, values) =
+            compute_values(&bytes, &dims, Mode::Slice, Axis::Z, 5, Component::Ez);
+
+        assert_eq!((width, height), (16, 16));
+        assert_eq!(values[0], 1.0); // (x=0, y=0)
+        assert_eq!(values[15 * width + 15], 2.0);
+        assert_eq!(values[3 * width + 7], -3.5);
+        assert_eq!(values[10 * width + 10], 0.0);
+    }
+
+    #[test]
+    fn compute_values_volume_mode_picks_max_abs_preserving_sign() {
+        let dims = GridDims::new(8, 8, 16); // extent 16 along Z (2 blocks deep)
+        let mut blocks = zero_blocks(&dims);
+        // Along the ray at (x=2, y=3): the largest-magnitude sample is
+        // negative, so the projection must report -3.0, not +2.5.
+        set_ez(&mut blocks, &dims, 2, 3, 0, 1.0);
+        set_ez(&mut blocks, &dims, 2, 3, 5, -3.0);
+        set_ez(&mut blocks, &dims, 2, 3, 10, 2.5);
+        set_ez(&mut blocks, &dims, 2, 3, 15, 0.5);
+        let bytes = build_snapshot_bytes(&blocks);
+
+        let (width, _height, values) =
+            compute_values(&bytes, &dims, Mode::Volume, Axis::Z, 0, Component::Ez);
+
+        assert_eq!(values[3 * width + 2], -3.0);
+    }
+
+    #[test]
+    fn palette_endpoints_match_colormap() {
+        let signed = build_palette(true);
+        assert_eq!(signed[0], colormap(-1.0, true));
+        assert_eq!(signed[255], colormap(1.0, true));
+
+        let energy = build_palette(false);
+        assert_eq!(energy[0], colormap(0.0, false));
+        assert_eq!(energy[255], colormap(1.0, false));
+    }
+
+    #[test]
+    fn palette_index_maps_back_near_the_matching_colormap_entry() {
+        // 256 buckets across the range means `palette[palette_index(t)]`
+        // can be off by a shade from `colormap(t)` at bucket boundaries;
+        // allow a small per-channel tolerance rather than exact equality.
+        let palette = build_palette(true);
+        for t in [-1.0, -0.5, 0.0, 0.3, 1.0] {
+            let idx = palette_index(t, true);
+            let got = palette[idx as usize];
+            let expected = colormap(t, true);
+            for c in 0..3 {
+                assert!(
+                    (got[c] as i16 - expected[c] as i16).abs() <= 3,
+                    "t={t} idx={idx} got={got:?} expected={expected:?}"
+                );
+            }
         }
     }
 }
