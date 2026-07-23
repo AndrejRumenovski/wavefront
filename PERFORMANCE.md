@@ -199,9 +199,91 @@ real, if much smaller, per-step cost for the clone-and-channel round trip
 real available parallelism. Memory bandwidth may still be part of why
 scaling plateaus rather than continuing to climb past ~6 threads (a
 reasonable inference from the SMT topology and the kernel's low arithmetic
-intensity, still not directly measured via hardware counters — see the
-`perf_event_paranoid` note above, unchanged), but it is evidently not the
-dominant limiter this session's first pass concluded it was.
+intensity) — see "Profiling the plateau" below, where this is checked
+against actual hardware counters instead of left as inference.
+
+### Profiling the plateau: what `perf stat` actually shows
+
+This machine's `kernel.perf_event_paranoid` defaults to `4` (unprivileged
+`perf_event_open` fully disabled), which is why the rest of this document
+had left memory bandwidth as an inference rather than a measurement.
+Temporarily lowering it (`sudo sysctl kernel.perf_event_paranoid=1`, runtime
+only — reverts on reboot, or explicitly with the same command and `=4`)
+unblocks core-PMU counters for an unprivileged process. It does *not*
+unblock the AMD data-fabric/UMC uncore PMU that would give a direct DRAM
+GB/s figure (`perf list`'s `nps1_die_to_dram` metric errors with "Bad event
+or PMU" even at `paranoid=1` on this kernel/hardware combination) — so this
+is still a proxy-based reading, via cache-miss and stall-cycle counters, not
+a direct bandwidth number. `AMD stalled-cycles-backend` is also
+`<not supported>` on this chip (Zen 3, `Ryzen 5 5600G`: 6 cores / 12
+threads, 3 MiB L2 total (6×512 KiB private), 16 MiB shared L3, one CCX).
+
+**Method**: `perf stat -e cycles,instructions,cache-references,cache-misses,
+l2_cache_misses_from_dc_misses,stalled-cycles-frontend,branch-misses`
+wrapped around the same `cube` (256³) case `thread_scaling.sh` uses, at
+`RAYON_NUM_THREADS` 1/4/6/8/12 — chosen to straddle the physical-core count
+(6) and the plateau/decline `thread_scaling.csv` already showed starting
+somewhere past it. `perf stat` requested more events than this chip has
+hardware counters for, so the kernel time-slices them (visible as
+`(71.43%)` next to every line) and scales the reported counts back up —
+standard practice, but it means these are statistically-scaled estimates,
+not exact hardware counts. As a sanity check, a clean re-run of the same
+five thread counts *without* `perf` attached landed within 1% of the
+perf-instrumented run's own `steps/s` at every point (e.g. 1 thread:
+10.3 vs. 10.2 steps/s; 12 threads: 13.8 vs. 13.7 steps/s) — `perf`'s own
+overhead isn't distorting the comparison. These runs are faster in absolute
+terms than the committed `thread_scaling.csv` table above (10.2 steps/s at
+1 thread here vs. 8.7 there) — expected, since this document already treats
+throughput as machine/load-dependent and not CI-gated; this sweep is only
+used for the *relative* trend across thread counts within itself, not as a
+replacement for `thread_scaling.csv`/`.png`.
+
+| Threads | steps/s | cache-miss rate | cycles/thread (normalized) | frontend-stall % of cycles | L2-miss traffic/thread (normalized) |
+|---:|---:|---:|---:|---:|---:|
+| 1  | 10.2 | 20.4% | 68.1B | 2.1% | 575.0M |
+| 4  | 14.9 | 19.2% | 41.6B | 1.2% | 353.3M |
+| 6  | 14.5 | 20.0% | 38.1B | 1.7% | 242.0M |
+| 8  | 14.2 | 22.6% | 38.8B | 1.8% | 209.2M |
+| 12 | 13.7 | 25.8% | 37.1B | 1.9% | 163.0M |
+
+("Normalized" columns divide `perf stat`'s process-wide total by thread
+count, since `perf stat` sums counters across every rayon worker thread —
+comparing *that* raw sum across thread counts would just measure "how many
+cores were burning cycles," not efficiency.)
+
+Two things point toward shared-cache/memory contention, not SMT
+execution-port contention, as the more consistent explanation for the
+plateau and mild decline past 4-6 threads:
+
+- **Cache-miss rate climbs monotonically past 4 threads** (19.2% → 25.8%,
+  4 to 12 threads) even though total `cache-references` stays essentially
+  flat (~7.9-8.0B) across that same range — the same volume of cache
+  traffic is increasingly missing, consistent with more concurrent slabs'
+  working sets competing for the single 16 MiB L3 shared across all 6
+  cores/12 threads of this one-CCX chip.
+- **Per-thread cycles stop shrinking once threads exceed the physical core
+  count**, even though each thread's share of the domain (and so its real
+  compute) keeps shrinking: 1→4 threads nearly halves cycles/thread
+  (68.1B→41.6B) as expected from real parallel speedup, but 4→12 threads
+  is flat (41.6B→37.1B) despite 3× fewer voxels per thread. Work is
+  shrinking per-thread; cycles aren't — the difference is being spent
+  somewhere other than the Yee-update arithmetic itself.
+
+Meanwhile, **frontend-stall cycles stay a small, only mildly-rising fraction
+of total cycles throughout (1.2-2.1%)** — if SMT sibling threads fighting
+over the frontend/execution ports were the dominant effect, this is the
+counter that would be expected to climb sharply past 6 threads (the
+physical-core boundary, where SMT siblings start actually sharing a core);
+it doesn't. That doesn't rule SMT contention out entirely (this chip has no
+working `stalled-cycles-backend` counter to check execution-port pressure
+directly), but the cache-miss-rate and per-thread-cycles evidence is more
+direct and points the same direction: **the post-~4-6-thread plateau is
+better explained by shared L3 capacity/bandwidth contention across this
+chip's single CCX than by core-count or SMT execution-unit limits** — a more
+specific conclusion than the inference this section previously stood on,
+though still short of a directly-measured DRAM GB/s ceiling, since the
+uncore PMU needed for that remains inaccessible on this hardware/kernel
+combination.
 
 **Practical takeaway**: the channel-based halo exchange was actively
 counterproductive for domains with a large XY cross-section relative to
@@ -264,6 +346,23 @@ python3 benchmarks/plot_halo_fix_before_after.py    # regenerates benchmarks/hal
                                                      # (a saved snapshot from commit 87480c4, pre-fix)
 
 benchmarks/snapshot_throughput.sh /path/on/a/real/disk
+```
+
+For the `perf stat` sweep in "Profiling the plateau" above, unprivileged
+`perf_event_open` needs unblocking first (root, so run this yourself, not
+from an automated/sandboxed shell):
+
+```sh
+sudo sysctl kernel.perf_event_paranoid=1   # runtime only; revert with =4, or just reboot
+
+SCRATCH=$(mktemp -d)
+for t in 1 4 6 8 12; do
+    rm -f "$SCRATCH"/*.grid "$SCRATCH"/*.bin
+    RAYON_NUM_THREADS=$t perf stat \
+        -e cycles,instructions,cache-references,cache-misses,l2_cache_misses_from_dc_misses,stalled-cycles-frontend,branch-misses \
+        target/release/wavefront --nx 256 --ny 256 --nz 256 --steps 150 --snapshot-every 1000 \
+        --materials "$SCRATCH/m.grid" --output "$SCRATCH/t.bin"
+done
 ```
 
 Both `.sh` scripts default their thread sweep / domain size to sensible
