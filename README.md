@@ -47,9 +47,10 @@ FDTD implementation, not just code that produces plausible-looking output.
 - Geometry: structures can be described in a small plain-text scene format
   (spheres and boxes tagged with material constants) and voxelized into the
   material grid, instead of only the hardcoded demo sphere (`src/scene.rs`).
-- Visualization: `wavefront-view`, a second binary in this crate, renders
-  one 2D slice of one snapshot as a PPM image, so a run's output can
-  actually be looked at (`src/bin/wavefront-view.rs`).
+- Visualization: `wavefront-view`, a second binary in this crate, renders a
+  2D slice or a whole-domain maximum-intensity projection of one snapshot as
+  a PPM image, or a range of snapshots as an animated GIF, so a run's output
+  can actually be looked at (`src/bin/wavefront-view.rs`).
 
 ## Requirements
 
@@ -84,8 +85,8 @@ on (`target-cpu=native`) — don't copy them to a different CPU
 microarchitecture; rebuild there instead:
 
 - `target/release/wavefront` — the simulator.
-- `target/release/wavefront-view` — the slice-to-image post-processing tool
-  (see [Visualize](#visualize)).
+- `target/release/wavefront-view` — the snapshot-to-image/animation
+  post-processing tool (see [Visualize](#visualize)).
 
 Both share the core solver code via a library crate (`src/lib.rs`); the
 simulator binary itself is just `src/main.rs`'s CLI/orchestration layer.
@@ -211,15 +212,27 @@ know `nx`/`ny`/`nz`.
 
 ## Visualize
 
-`wavefront-view` renders one 2D slice of one snapshot as a binary PPM image
-(`.ppm` -- viewable directly in GIMP, or converted with
-`magick slice.ppm slice.png`). It needs the same `--nx`/`--ny`/`--nz` the
-simulation was run with, since the trajectory file has no header:
+`wavefront-view` renders one snapshot as a binary PPM image (`.ppm` --
+viewable directly in GIMP, or converted with `magick slice.ppm slice.png`),
+or a range of snapshots as one animated GIF. It needs the same
+`--nx`/`--ny`/`--nz` the simulation was run with, since the trajectory file
+has no header:
 
 ```sh
+# One 2D slice of one snapshot, as a PPM:
 ./target/release/wavefront-view \
     --input wave_trajectory.bin --nx 128 --ny 128 --nz 128 \
     --snapshot 10 --axis z --component energy --output slice.ppm
+
+# A maximum-intensity projection through the whole domain, same snapshot:
+./target/release/wavefront-view \
+    --input wave_trajectory.bin --nx 128 --ny 128 --nz 128 \
+    --snapshot 10 --mode volume --axis z --output volume.ppm
+
+# Every snapshot from 0 to 40, as one looping animated GIF:
+./target/release/wavefront-view \
+    --input wave_trajectory.bin --nx 128 --ny 128 --nz 128 \
+    --snapshots 0:40 --fps 12 --output wave.gif
 ```
 
 | Flag                | Meaning                                                    | Default       |
@@ -227,14 +240,21 @@ simulation was run with, since the trajectory file has no header:
 | `--input <PATH>`    | Trajectory file to read (required)                          |               |
 | `--nx/-ny/-nz <N>`  | Grid dimensions the run used (required)                      |               |
 | `--snapshot <N>`    | Which snapshot to render, 0-indexed                          | `0`           |
-| `--axis <x\|y\|z>`  | Which axis to hold fixed (the slice's normal)                | `z`           |
-| `--slice <N>`       | Index along `--axis` to slice at                             | middle        |
+| `--snapshots <A>:<B>` | Render an inclusive snapshot range as one animated GIF instead (requires `--output` to end in `.gif`; mutually exclusive with `--snapshot`) | |
+| `--fps <N>`         | Animation playback rate, for `--snapshots`                  | `10`          |
+| `--mode <slice\|volume>` | `slice`: one 2D cross-section. `volume`: a maximum-intensity projection through the *entire* domain along `--axis` (`--slice` is ignored) | `slice` |
+| `--axis <x\|y\|z>`  | Which axis to hold fixed (`slice`) or project along (`volume`) | `z`         |
+| `--slice <N>`       | Index along `--axis` to slice at (`slice` mode only)         | middle        |
 | `--component <C>`   | `ex`, `ey`, `ez`, `hx`, `hy`, `hz`, or `energy` (sum of squares of all six) | `energy` |
-| `--output <PATH>`   | Output PPM path                                              | `slice.ppm`   |
+| `--output <PATH>`   | Output path (`.ppm` for a single snapshot, `.gif` for a range) | `slice.ppm` |
 
-Values are normalized per-image by their own maximum magnitude and mapped
-through a white-to-red/white-to-blue diverging colormap (white-to-red only
-for `energy`, which is never negative).
+Values are normalized by the maximum magnitude across every frame being
+rendered (a single snapshot's own max, in the single-frame case, so this
+isn't a behavior change there) and mapped through a white-to-red/
+white-to-blue diverging colormap (white-to-red only for `energy`, which is
+never negative). The GIF encoder is hand-written, like the PPM writer --
+real (adaptive-dictionary) LZW compression and a `NETSCAPE2.0` looping
+extension, no image/GIF dependency added.
 
 ## Tests
 

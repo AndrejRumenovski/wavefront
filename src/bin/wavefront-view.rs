@@ -1,24 +1,46 @@
-//! `wavefront-view` -- a minimal post-processing tool that turns one 2D
-//! slice of one snapshot out of a `wave_trajectory.bin` file into a viewable
-//! image.
+//! `wavefront-view` -- a minimal post-processing tool that turns snapshots
+//! out of a `wave_trajectory.bin` file into viewable images.
 //!
 //! `wave_trajectory.bin` has no header (see `src/engine.rs::serialize_snapshot`
 //! and `src/layout.rs::FieldBlock`'s doc comment for the exact on-disk
 //! layout), so this tool needs the same `--nx`/`--ny`/`--nz` you ran the
 //! simulation with to make sense of the raw bytes.
 //!
-//! Images are written as binary PPM (`.ppm`, the "P6" format): a tiny,
-//! trivially-specified, uncompressed format that needs zero extra
-//! dependencies to write by hand -- deliberately, since this crate keeps
-//! its dependency set small and pinned (see `Cargo.toml`). Most image
-//! viewers, GIMP, and ImageMagick's `convert`/`magick` all read it directly;
-//! convert to PNG with `magick slice.ppm slice.png` if you need one.
+//! Two render modes (`--mode`):
+//! - `slice` (default): one 2D cross-section, holding one axis fixed.
+//! - `volume`: a maximum-intensity projection through the *entire* domain
+//!   along the chosen axis -- at each pixel, the voxel with the largest
+//!   `|value|` anywhere along that ray, keeping its sign. This is the
+//!   standard, simplest form of volumetric rendering (used throughout
+//!   medical/scientific visualization for exactly this reason: no lighting
+//!   or opacity model to get wrong, and every feature in the volume shows up
+//!   somewhere in the projection).
 //!
-//! The file is memory-mapped (via `memmap2`, already a dependency) rather
-//! than read into a `Vec` -- consistent with the rest of the crate's
-//! zero-copy philosophy, and it means only the handful of pages this tool
-//! actually touches ever get faulted in, regardless of how large the
-//! trajectory file is.
+//! Two output shapes:
+//! - A single `--snapshot <N>` renders one binary PPM (`.ppm`, "P6") image --
+//!   deliberately dependency-free, since most image viewers, GIMP, and
+//!   ImageMagick's `convert`/`magick` all read it directly.
+//! - A `--snapshots <A>:<B>` range renders every snapshot in that (inclusive)
+//!   range into one animated GIF (`.gif`, GIF89a) instead -- also
+//!   hand-written, for the same reason the PPM writer is: this crate keeps
+//!   its dependency set small and pinned (see `Cargo.toml`), and GIF's LZW
+//!   compression, while more involved than PPM's raw bytes, is still a
+//!   fully-specified, implementable-by-hand format. Encoded here as *real*
+//!   LZW (an adaptive dictionary, not a fixed-width placeholder), since
+//!   that's the same standard this crate holds its other from-scratch
+//!   implementations (`io_uring` snapshot I/O, the SIMD Yee kernels) to.
+//!
+//! Colors are normalized against the *global* max `|value|` across every
+//! frame being rendered (a single snapshot's own max, in the single-frame
+//! case -- so this is not a behavior change for existing single-image use),
+//! so brightness is comparable across an animation's frames instead of each
+//! frame separately auto-contrasting itself.
+//!
+//! The trajectory file is memory-mapped (via `memmap2`, already a
+//! dependency) rather than read into a `Vec` -- consistent with the rest of
+//! the crate's zero-copy philosophy, and it means only the handful of pages
+//! this tool actually touches ever get faulted in, regardless of how large
+//! the trajectory file is.
 
 use memmap2::Mmap;
 use std::fs::File;
@@ -68,31 +90,55 @@ impl Component {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Slice,
+    Volume,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SnapshotSpec {
+    Single(usize),
+    Range(usize, usize),
+}
+
 struct Config {
     input: PathBuf,
     nx: usize,
     ny: usize,
     nz: usize,
-    snapshot: usize,
+    snapshots: SnapshotSpec,
+    mode: Mode,
     axis: Axis,
     slice: Option<usize>,
     component: Component,
     output: PathBuf,
+    fps: u32,
 }
 
 fn print_usage() {
     eprintln!(
-        "wavefront-view -- render one 2D slice of a wave_trajectory.bin snapshot as a PPM image\n\n\
+        "wavefront-view -- render wave_trajectory.bin snapshot(s) as PPM or animated GIF\n\n\
          USAGE:\n    wavefront-view --input <PATH> --nx <N> --ny <N> --nz <N> [OPTIONS]\n\n\
          REQUIRED:\n\
          \x20   --input <PATH>       wave_trajectory.bin (or equivalent) to read\n\
          \x20   --nx/--ny/--nz <N>   grid dimensions the simulation was run with\n\n\
          OPTIONS:\n\
          \x20   --snapshot <N>       which snapshot to render, 0-indexed [default: 0]\n\
-         \x20   --axis <x|y|z>       which axis to hold fixed (slice normal) [default: z]\n\
-         \x20   --slice <N>          index along --axis to slice at [default: middle]\n\
+         \x20   --snapshots <A>:<B>  render an inclusive range of snapshots as one\n\
+         \x20                        animated GIF instead of a single PPM -- requires\n\
+         \x20                        --output to end in .gif; mutually exclusive with\n\
+         \x20                        --snapshot\n\
+         \x20   --fps <N>            animation playback rate for --snapshots [default: 10]\n\
+         \x20   --mode <M>           slice (one 2D cross-section) or volume (maximum-\n\
+         \x20                        intensity projection through the whole domain along\n\
+         \x20                        --axis; --slice is ignored in this mode) [default: slice]\n\
+         \x20   --axis <x|y|z>       which axis to hold fixed (slice) or project along\n\
+         \x20                        (volume) [default: z]\n\
+         \x20   --slice <N>          index along --axis to slice at (slice mode only)\n\
+         \x20                        [default: middle]\n\
          \x20   --component <C>      ex, ey, ez, hx, hy, hz, or energy [default: energy]\n\
-         \x20   --output <PATH>      output PPM path [default: slice.ppm]\n\
+         \x20   --output <PATH>      output path [default: slice.ppm]\n\
          \x20   -h, --help           print this message"
     );
 }
@@ -102,11 +148,14 @@ fn parse_args() -> Result<Config, String> {
     let mut nx: Option<usize> = None;
     let mut ny: Option<usize> = None;
     let mut nz: Option<usize> = None;
-    let mut snapshot = 0usize;
+    let mut snapshot: Option<usize> = None;
+    let mut snapshots_range: Option<(usize, usize)> = None;
+    let mut mode = Mode::Slice;
     let mut axis = Axis::Z;
     let mut slice: Option<usize> = None;
     let mut component = Component::Energy;
     let mut output = PathBuf::from("slice.ppm");
+    let mut fps = 10u32;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -124,7 +173,38 @@ fn parse_args() -> Result<Config, String> {
             "--nx" => nx = Some(parse_num("--nx", next_value("--nx")?)?),
             "--ny" => ny = Some(parse_num("--ny", next_value("--ny")?)?),
             "--nz" => nz = Some(parse_num("--nz", next_value("--nz")?)?),
-            "--snapshot" => snapshot = parse_num("--snapshot", next_value("--snapshot")?)?,
+            "--snapshot" => snapshot = Some(parse_num("--snapshot", next_value("--snapshot")?)?),
+            "--snapshots" => {
+                let raw = next_value("--snapshots")?;
+                let (a, b) = raw.split_once(':').ok_or_else(|| {
+                    format!("invalid --snapshots {raw:?}: expected <A>:<B>, e.g. 0:20")
+                })?;
+                let a = parse_num("--snapshots", a.to_string())?;
+                let b = parse_num("--snapshots", b.to_string())?;
+                if a > b {
+                    return Err(format!(
+                        "invalid --snapshots {raw:?}: start ({a}) must be <= end ({b})"
+                    ));
+                }
+                snapshots_range = Some((a, b));
+            }
+            "--fps" => {
+                fps = next_value("--fps")?
+                    .parse::<u32>()
+                    .map_err(|_| "invalid --fps: expected a positive integer".to_string())?;
+                if fps == 0 {
+                    return Err("invalid --fps: must be at least 1".to_string());
+                }
+            }
+            "--mode" => {
+                mode = match next_value("--mode")?.as_str() {
+                    "slice" => Mode::Slice,
+                    "volume" => Mode::Volume,
+                    other => {
+                        return Err(format!("invalid --mode: {other} (expected slice or volume)"))
+                    }
+                }
+            }
             "--axis" => {
                 axis = match next_value("--axis")?.as_str() {
                     "x" => Axis::X,
@@ -159,16 +239,38 @@ fn parse_args() -> Result<Config, String> {
         }
     }
 
+    let snapshots = match (snapshot, snapshots_range) {
+        (Some(_), Some(_)) => {
+            return Err("--snapshot and --snapshots are mutually exclusive".to_string())
+        }
+        (Some(n), None) => SnapshotSpec::Single(n),
+        (None, Some((a, b))) => {
+            let is_gif = output
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("gif"));
+            if !is_gif {
+                return Err(format!(
+                    "--snapshots requires --output to end in .gif (got {output:?})"
+                ));
+            }
+            SnapshotSpec::Range(a, b)
+        }
+        (None, None) => SnapshotSpec::Single(0),
+    };
+
     Ok(Config {
         input: input.ok_or("--input is required")?,
         nx: nx.ok_or("--nx is required")?,
         ny: ny.ok_or("--ny is required")?,
         nz: nz.ok_or("--nz is required")?,
-        snapshot,
+        snapshots,
+        mode,
         axis,
         slice,
         component,
         output,
+        fps,
     })
 }
 
@@ -200,6 +302,9 @@ fn read_component(
     f32::from_le_bytes(bytes)
 }
 
+/// Samples one component at one voxel. Signed components return their
+/// signed value; `Energy` returns the (always non-negative) sum of squares
+/// of all six.
 fn sample(snapshot_bytes: &[u8], bx_n: usize, by_n: usize, x: usize, y: usize, z: usize, component: Component) -> f32 {
     match component.field_index() {
         Some(idx) => read_component(snapshot_bytes, bx_n, by_n, x, y, z, idx),
@@ -210,6 +315,62 @@ fn sample(snapshot_bytes: &[u8], bx_n: usize, by_n: usize, x: usize, y: usize, z
             })
             .sum(),
     }
+}
+
+/// Computes one frame's `width x height` grid of raw (uncolored) values,
+/// row-major, for either render mode.
+///
+/// - `Mode::Slice`: samples the single plane at `slice_index` along `axis`.
+/// - `Mode::Volume`: for each pixel, scans the *entire* extent along `axis`
+///   and keeps the sample with the largest `|value|` (a maximum-intensity
+///   projection) -- the whole domain collapsed onto one 2D image.
+fn compute_values(
+    snapshot_bytes: &[u8],
+    dims: &GridDims,
+    mode: Mode,
+    axis: Axis,
+    slice_index: usize,
+    component: Component,
+) -> (usize, usize, Vec<f32>) {
+    let (bx_n, by_n, _) = dims.block_dims();
+    let (width, height, extent_along_axis) = match axis {
+        Axis::X => (dims.ny, dims.nz, dims.nx),
+        Axis::Y => (dims.nx, dims.nz, dims.ny),
+        Axis::Z => (dims.nx, dims.ny, dims.nz),
+    };
+
+    let mut values = vec![0.0f32; width * height];
+    for v in 0..height {
+        for u in 0..width {
+            let value = match mode {
+                Mode::Slice => {
+                    let (x, y, z) = match axis {
+                        Axis::X => (slice_index, u, v),
+                        Axis::Y => (u, slice_index, v),
+                        Axis::Z => (u, v, slice_index),
+                    };
+                    sample(snapshot_bytes, bx_n, by_n, x, y, z, component)
+                }
+                Mode::Volume => {
+                    let mut best = 0.0f32;
+                    for d in 0..extent_along_axis {
+                        let (x, y, z) = match axis {
+                            Axis::X => (d, u, v),
+                            Axis::Y => (u, d, v),
+                            Axis::Z => (u, v, d),
+                        };
+                        let s = sample(snapshot_bytes, bx_n, by_n, x, y, z, component);
+                        if s.abs() > best.abs() {
+                            best = s;
+                        }
+                    }
+                    best
+                }
+            };
+            values[v * width + u] = value;
+        }
+    }
+    (width, height, values)
 }
 
 /// Maps a normalized value `t` (in `[-1, 1]` for signed components, `[0, 1]`
@@ -245,6 +406,184 @@ fn write_ppm(path: &std::path::Path, width: usize, height: usize, pixels: &[[u8;
     Ok(())
 }
 
+/// A minimal, dependency-free GIF89a encoder: one global 256-color palette
+/// (built from `colormap`, so animations use exactly the same colors as a
+/// single-frame PPM would), a `NETSCAPE2.0` looping extension, and real
+/// (adaptive-dictionary) LZW-compressed image data per frame -- not a
+/// fixed-width placeholder encoding, since this crate holds its other
+/// from-scratch formats (the PPM writer, the on-disk snapshot layout) to
+/// the same "actually implement the real thing" standard.
+mod gif {
+    use std::collections::HashMap;
+    use std::io::{self, Write};
+
+    const MIN_CODE_SIZE: u8 = 8; // 256-color palette
+    const CLEAR_CODE: u16 = 1 << MIN_CODE_SIZE; // 256
+    const END_CODE: u16 = CLEAR_CODE + 1; // 257
+    const FIRST_FREE_CODE: u16 = CLEAR_CODE + 2; // 258
+    const MAX_CODE: u16 = 4095; // 12-bit code space
+
+    /// Packs a stream of variable-width LZW codes into GIF's sub-block
+    /// format (LSB-first bit packing, 255-byte sub-blocks, zero-length
+    /// block terminator).
+    struct BitWriter {
+        bytes: Vec<u8>,
+        bit_buf: u32,
+        bit_count: u32,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            BitWriter { bytes: Vec::new(), bit_buf: 0, bit_count: 0 }
+        }
+
+        fn write_code(&mut self, code: u16, width: u8) {
+            self.bit_buf |= (code as u32) << self.bit_count;
+            self.bit_count += width as u32;
+            while self.bit_count >= 8 {
+                self.bytes.push((self.bit_buf & 0xFF) as u8);
+                self.bit_buf >>= 8;
+                self.bit_count -= 8;
+            }
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            if self.bit_count > 0 {
+                self.bytes.push((self.bit_buf & 0xFF) as u8);
+            }
+            self.bytes
+        }
+    }
+
+    /// LZW-compresses one frame's palette-index pixels into GIF sub-blocks,
+    /// including the leading minimum-code-size byte and trailing
+    /// zero-length terminator.
+    fn lzw_encode(indices: &[u8]) -> Vec<u8> {
+        let mut writer = BitWriter::new();
+        let mut code_width = MIN_CODE_SIZE + 1;
+        let mut next_code = FIRST_FREE_CODE;
+        // Dictionary: (prefix code, next byte) -> code. Reset alongside a
+        // Clear Code whenever the 12-bit code space fills up.
+        let mut dict: HashMap<(u16, u8), u16> = HashMap::new();
+
+        writer.write_code(CLEAR_CODE, code_width);
+
+        let mut iter = indices.iter().copied();
+        let Some(first) = iter.next() else {
+            writer.write_code(END_CODE, code_width);
+            let mut out = vec![MIN_CODE_SIZE];
+            pack_subblocks(&mut out, &writer.finish());
+            return out;
+        };
+
+        let mut prefix = first as u16; // single-byte codes equal their byte value
+        for byte in iter {
+            match dict.get(&(prefix, byte)) {
+                Some(&code) => prefix = code,
+                None => {
+                    writer.write_code(prefix, code_width);
+                    dict.insert((prefix, byte), next_code);
+                    next_code += 1;
+                    if next_code > MAX_CODE {
+                        writer.write_code(CLEAR_CODE, code_width);
+                        dict.clear();
+                        next_code = FIRST_FREE_CODE;
+                        code_width = MIN_CODE_SIZE + 1;
+                    } else if next_code > (1 << code_width) {
+                        code_width += 1;
+                    }
+                    prefix = byte as u16;
+                }
+            }
+        }
+        writer.write_code(prefix, code_width);
+        writer.write_code(END_CODE, code_width);
+
+        let mut out = vec![MIN_CODE_SIZE];
+        pack_subblocks(&mut out, &writer.finish());
+        out
+    }
+
+    fn pack_subblocks(out: &mut Vec<u8>, data: &[u8]) {
+        for chunk in data.chunks(255) {
+            out.push(chunk.len() as u8);
+            out.extend_from_slice(chunk);
+        }
+        out.push(0); // block terminator
+    }
+
+    /// Writes a complete animated GIF: one global palette, looped playback,
+    /// one Graphic Control Extension + Image Descriptor + LZW data block
+    /// per frame.
+    pub fn write_animated_gif(
+        path: &std::path::Path,
+        width: usize,
+        height: usize,
+        palette: &[[u8; 3]; 256],
+        frames: &[Vec<u8>],
+        delay_centiseconds: u16,
+    ) -> io::Result<()> {
+        let mut file = io::BufWriter::new(std::fs::File::create(path)?);
+
+        file.write_all(b"GIF89a")?;
+        file.write_all(&(width as u16).to_le_bytes())?;
+        file.write_all(&(height as u16).to_le_bytes())?;
+        // Packed byte: global color table present, color resolution 7,
+        // not sorted, global color table size = 2^(7+1) = 256.
+        file.write_all(&[0b1111_0111, 0, 0])?; // background index 0, no aspect ratio
+
+        for [r, g, b] in palette {
+            file.write_all(&[*r, *g, *b])?;
+        }
+
+        // NETSCAPE2.0 application extension: loop forever.
+        file.write_all(&[0x21, 0xFF, 11])?;
+        file.write_all(b"NETSCAPE2.0")?;
+        file.write_all(&[3, 1, 0, 0, 0])?;
+
+        for frame in frames {
+            // Graphic Control Extension: no transparency, given delay.
+            file.write_all(&[0x21, 0xF9, 4, 0b0000_0000])?;
+            file.write_all(&delay_centiseconds.to_le_bytes())?;
+            file.write_all(&[0, 0])?;
+
+            // Image Descriptor: full-frame, no local color table.
+            file.write_all(&[0x2C])?;
+            file.write_all(&0u16.to_le_bytes())?; // left
+            file.write_all(&0u16.to_le_bytes())?; // top
+            file.write_all(&(width as u16).to_le_bytes())?;
+            file.write_all(&(height as u16).to_le_bytes())?;
+            file.write_all(&[0])?; // no local color table, no interlace
+
+            file.write_all(&lzw_encode(frame))?;
+        }
+
+        file.write_all(&[0x3B])?; // trailer
+        Ok(())
+    }
+}
+
+/// Builds a 256-entry palette by sampling `colormap` across the value range
+/// a frame's normalized `t` can take: the full `[-1, 1]` for signed
+/// components, or `[0, 1]` (packed into the same 256 slots for finer
+/// gradation) for `Energy`.
+fn build_palette(signed: bool) -> [[u8; 3]; 256] {
+    let mut palette = [[0u8; 3]; 256];
+    for (i, entry) in palette.iter_mut().enumerate() {
+        let frac = i as f32 / 255.0;
+        let t = if signed { -1.0 + 2.0 * frac } else { frac };
+        *entry = colormap(t, signed);
+    }
+    palette
+}
+
+/// Maps a normalized value in `[-1, 1]` (signed) or `[0, 1]` (energy) to a
+/// palette index built by `build_palette`.
+fn palette_index(t: f32, signed: bool) -> u8 {
+    let frac = if signed { (t + 1.0) / 2.0 } else { t };
+    (frac.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 fn run(config: Config) -> Result<(), String> {
     let dims = GridDims::new(config.nx, config.ny, config.nz);
     let (bx_n, by_n, bz_n) = dims.block_dims();
@@ -273,57 +612,108 @@ fn run(config: Config) -> Result<(), String> {
         ));
     }
     let num_snapshots = mmap.len() / snapshot_bytes;
-    if config.snapshot >= num_snapshots {
-        return Err(format!(
-            "--snapshot {} out of range: file has {num_snapshots} snapshot(s)",
-            config.snapshot
-        ));
-    }
-    let snapshot_bytes_slice =
-        &mmap[config.snapshot * snapshot_bytes..(config.snapshot + 1) * snapshot_bytes];
 
-    let (width, height, slice_index, extent_along_axis) = match config.axis {
-        Axis::X => (dims.ny, dims.nz, config.slice.unwrap_or(dims.nx / 2), dims.nx),
-        Axis::Y => (dims.nx, dims.nz, config.slice.unwrap_or(dims.ny / 2), dims.ny),
-        Axis::Z => (dims.nx, dims.ny, config.slice.unwrap_or(dims.nz / 2), dims.nz),
+    let indices: Vec<usize> = match config.snapshots {
+        SnapshotSpec::Single(n) => vec![n],
+        SnapshotSpec::Range(a, b) => (a..=b).collect(),
     };
-    if slice_index >= extent_along_axis {
+    for &n in &indices {
+        if n >= num_snapshots {
+            return Err(format!(
+                "--snapshot(s) {n} out of range: file has {num_snapshots} snapshot(s)"
+            ));
+        }
+    }
+
+    let extent_along_axis = match config.axis {
+        Axis::X => dims.nx,
+        Axis::Y => dims.ny,
+        Axis::Z => dims.nz,
+    };
+    let slice_index = config.slice.unwrap_or(extent_along_axis / 2);
+    if config.mode == Mode::Slice && slice_index >= extent_along_axis {
         return Err(format!(
             "--slice {slice_index} out of range for axis {:?} (extent {extent_along_axis})",
             config.axis
         ));
     }
 
-    let mut values = vec![0.0f32; width * height];
-    for v in 0..height {
-        for u in 0..width {
-            let (x, y, z) = match config.axis {
-                Axis::X => (slice_index, u, v),
-                Axis::Y => (u, slice_index, v),
-                Axis::Z => (u, v, slice_index),
-            };
-            values[v * width + u] = sample(snapshot_bytes_slice, bx_n, by_n, x, y, z, config.component);
+    let mut frames: Vec<(usize, usize, Vec<f32>)> = Vec::with_capacity(indices.len());
+    for &n in &indices {
+        let bytes = &mmap[n * snapshot_bytes..(n + 1) * snapshot_bytes];
+        frames.push(compute_values(
+            bytes,
+            &dims,
+            config.mode,
+            config.axis,
+            slice_index,
+            config.component,
+        ));
+    }
+
+    let global_max_abs = frames
+        .iter()
+        .flat_map(|(_, _, values)| values.iter())
+        .fold(0.0f32, |acc, v| acc.max(v.abs()));
+    let signed = config.component.is_signed();
+
+    match config.snapshots {
+        SnapshotSpec::Single(n) => {
+            let (width, height, values) = &frames[0];
+            let pixels: Vec<[u8; 3]> = values
+                .iter()
+                .map(|&v| {
+                    let t = if global_max_abs > 0.0 { v / global_max_abs } else { 0.0 };
+                    colormap(t, signed)
+                })
+                .collect();
+            write_ppm(&config.output, *width, *height, &pixels)
+                .map_err(|e| format!("failed to write {:?}: {e}", config.output))?;
+            eprintln!(
+                "wavefront-view: wrote {:?} ({width}x{height}, snapshot {n}/{num_snapshots}, mode {:?}, axis {:?}, \
+                 component {:?}, max |value| = {global_max_abs:e})",
+                config.output, config.mode, config.axis, config.component
+            );
+        }
+        SnapshotSpec::Range(a, b) => {
+            let (width, height, _) = &frames[0];
+            let (width, height) = (*width, *height);
+            let palette = build_palette(signed);
+            let frame_indices: Vec<Vec<u8>> = frames
+                .iter()
+                .map(|(_, _, values)| {
+                    values
+                        .iter()
+                        .map(|&v| {
+                            let t = if global_max_abs > 0.0 { v / global_max_abs } else { 0.0 };
+                            palette_index(t, signed)
+                        })
+                        .collect()
+                })
+                .collect();
+            let delay_centiseconds = (100 / config.fps.max(1)).max(1) as u16;
+            gif::write_animated_gif(
+                &config.output,
+                width,
+                height,
+                &palette,
+                &frame_indices,
+                delay_centiseconds,
+            )
+            .map_err(|e| format!("failed to write {:?}: {e}", config.output))?;
+            eprintln!(
+                "wavefront-view: wrote {:?} ({width}x{height}, {} frame(s) [{a}..={b}], {} fps, mode {:?}, \
+                 axis {:?}, component {:?}, max |value| = {global_max_abs:e})",
+                config.output,
+                frame_indices.len(),
+                config.fps,
+                config.mode,
+                config.axis,
+                config.component
+            );
         }
     }
 
-    let max_abs = values.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
-    let signed = config.component.is_signed();
-    let pixels: Vec<[u8; 3]> = values
-        .iter()
-        .map(|&v| {
-            let t = if max_abs > 0.0 { v / max_abs } else { 0.0 };
-            colormap(t, signed)
-        })
-        .collect();
-
-    write_ppm(&config.output, width, height, &pixels)
-        .map_err(|e| format!("failed to write {:?}: {e}", config.output))?;
-
-    eprintln!(
-        "wavefront-view: wrote {:?} ({width}x{height}, snapshot {}/{num_snapshots}, axis {:?} @ {slice_index}, \
-         component {:?}, max |value| = {max_abs:e})",
-        config.output, config.snapshot, config.axis, config.component
-    );
     Ok(())
 }
 
