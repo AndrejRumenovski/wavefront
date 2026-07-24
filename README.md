@@ -17,6 +17,45 @@ code. That's why the numerical claims below are backed by a closed-form
 correctness proof rather than left as an assertion (see `VALIDATION.md`,
 linked just below).
 
+## Numerically validated
+
+- **Second-order convergence**: measured phase-velocity error scales as
+  `dx^2.16` against the Yee scheme's own closed-form prediction of `2.03` —
+  both ≈2.0, the theoretical order for this scheme (see
+  [Validation](#validation), `VALIDATION.md`).
+- **CPML absorption converges to its analytic target**: measured reflection
+  coefficient drops monotonically over a 400× range of layer thickness,
+  closing to `6.4e-6` against a configured target of `1e-6` at the thickest
+  layer tested — within an order of magnitude, the expected gap between a
+  discretized, staircased boundary and its continuous-limit target.
+- **Bit-for-bit deterministic parallel execution**: the same domain run on
+  1 thread vs. many rayon workers produces byte-identical field state —
+  domain decomposition is a scheduling detail, not a source of numerical
+  drift (`engine::tests::multi_slab_decomposition_matches_single_slab_bit_for_bit`).
+- **End-to-end propagation checked against the speed of light**: a point
+  source's wavefront arrival time in vacuum matches `distance / c` directly
+  — a second, independent correctness check from the dispersion analysis
+  above (`engine::tests::wave_propagates_at_approximately_speed_of_light`).
+
+Both validation studies above are hard-gated in CI on every push, not just
+run once and screenshotted.
+
+## Highlights
+
+- Up to ~200 GB material grids, `mmap`-backed — far larger than physical
+  RAM, and exercised out-of-core at real scale (512³ voxels, ~134M) on
+  disk, not just claimed
+- AVX2-vectorized Yee-lattice update kernels, confirmed by disassembling
+  the release binary — not assumed from the `RUSTFLAGS`
+- **+34%** parallel speedup (peak, 4-6 threads) after redesigning the
+  halo exchange to read cross-slab neighbor data directly instead of
+  cloning it through a channel every step (see
+  [Performance](#performance), `PERFORMANCE.md`)
+- Double-buffered `O_DIRECT` + `io_uring` snapshot streaming, so storage
+  latency never stalls the timestep loop
+- 34 automated tests (22 library + 12 in the visualization tool) plus 2
+  CI-gated numerical validation studies, green on every push
+
 ## See it in action
 
 ![A Ricker-pulse wavefront expanding outward through a scene with two dielectric spheres, absorbed by the CPML boundary](assets/demo_wave.gif)
@@ -43,6 +82,18 @@ theory predicts (see [Validation](#validation), `VALIDATION.md`).
 Thread scaling on this workstation, after fixing a halo-exchange bottleneck
 that used to make more threads *slower*, not faster (see
 [Performance](#performance), `PERFORMANCE.md`).
+
+## Why Rust
+
+Rust's ownership model enables thread-safe parallel decomposition without a
+garbage collector, while still allowing the low-level tools this project
+actually needs: SIMD intrinsics, direct memory mapping, and asynchronous
+`io_uring` I/O. The unsafe code that does show up (raw-pointer cross-slab
+access, `mmap`, reinterpreting `FieldBlock`s as raw bytes for the snapshot
+format) is deliberately localized and each instance carries its own inline
+`SAFETY` argument for why it's sound — the type system covers everything
+else, so what remains unsafe is exactly the small, auditable surface where
+the compiler's guarantees run out.
 
 ## Implementation
 
