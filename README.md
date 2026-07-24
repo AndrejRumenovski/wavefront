@@ -1,101 +1,45 @@
 # wavefront
 
-## Why this matters
+## Overview
 
 Wavefront is a high-performance electromagnetic simulator that solves
 Maxwell's equations on dense voxelized domains much larger than system
-memory. The project combines computational electromagnetics, high-performance
-computing, numerical analysis, and systems programming into a single Rust
-codebase capable of simulating hundreds of gigabytes of material data on one
-workstation.
+memory, written in pure Rust. It began as an HPC-systems exercise —
+out-of-core data structures, SIMD kernels, race-free concurrent scheduling,
+asynchronous I/O — and grew a second goal along the way: being legible and
+credible on its own technical merits, not just working code. That's why the
+numerical claims in this README are backed by a closed-form correctness
+proof (see [Validation](#validation)) rather than left as an assertion.
 
-It was originally scoped as an HPC-systems exercise — dense out-of-core
-data structures, SIMD numerical kernels, race-free concurrent scheduling,
-asynchronous I/O — and later reframed toward a second goal: making the
-work legible and credible on its own technical merits, not just working
-code. That's why the numerical claims below are backed by a closed-form
-correctness proof rather than left as an assertion (see `VALIDATION.md`,
-linked just below).
+Rust's ownership model is what makes the combination practical: thread-safe
+parallel decomposition without a garbage collector, while still allowing
+SIMD intrinsics, direct memory mapping, and asynchronous `io_uring` I/O.
+The `unsafe` code that does appear — raw-pointer cross-slab access, `mmap`,
+reinterpreting field blocks as raw bytes for the snapshot format — is
+deliberately localized, each instance justified by its own inline `SAFETY`
+comment.
 
-## Numerically validated
+## Features
 
-- **Second-order convergence**: measured phase-velocity error scales as
-  `dx^2.16` against the Yee scheme's own closed-form prediction of `2.03` —
-  both ≈2.0, the theoretical order for this scheme (see
-  [Validation](#validation), `VALIDATION.md`).
-- **CPML absorption converges to its analytic target**: measured reflection
-  coefficient drops monotonically over a 400× range of layer thickness,
-  closing to `6.4e-6` against a configured target of `1e-6` at the thickest
-  layer tested — within an order of magnitude, the expected gap between a
-  discretized, staircased boundary and its continuous-limit target.
-- **Bit-for-bit deterministic parallel execution**: the same domain run on
-  1 thread vs. many rayon workers produces byte-identical field state —
-  domain decomposition is a scheduling detail, not a source of numerical
-  drift (`engine::tests::multi_slab_decomposition_matches_single_slab_bit_for_bit`).
-- **End-to-end propagation checked against the speed of light**: a point
-  source's wavefront arrival time in vacuum matches `distance / c` directly
-  — a second, independent correctness check from the dispersion analysis
-  above (`engine::tests::wave_propagates_at_approximately_speed_of_light`).
-
-Both validation studies above are hard-gated in CI on every push, not just
-run once and screenshotted.
-
-## Highlights
-
-- Up to ~200 GB material grids, `mmap`-backed — far larger than physical
-  RAM, and exercised out-of-core at real scale (512³ voxels, ~134M) on
-  disk, not just claimed
+- Out-of-core material grids up to ~200 GB, `mmap`-backed — exercised at
+  real scale (512³ voxels) on disk, not just claimed
 - AVX2-vectorized Yee-lattice update kernels, confirmed by disassembling
-  the release binary — not assumed from the `RUSTFLAGS`
-- **+34%** parallel speedup (peak, 4-6 threads) after redesigning the
-  halo exchange to read cross-slab neighbor data directly instead of
-  cloning it through a channel every step (see
-  [Performance](#performance), `PERFORMANCE.md`)
-- Double-buffered `O_DIRECT` + `io_uring` snapshot streaming, so storage
+  the release binary
+- Z-slab domain decomposition across a `rayon` thread pool, with race-free
+  direct cross-slab reads (no per-boundary allocation or copy)
+- Graded CPML absorbing boundary, so the domain behaves like open space
+  instead of a sealed reflective box
+- Double-buffered `O_DIRECT` + `io_uring` snapshot streaming — storage
   latency never stalls the timestep loop
-- 34 automated tests (22 library + 12 in the visualization tool) plus 2
-  CI-gated numerical validation studies, green on every push
+- Configurable point sources (Gaussian, sinusoid, Ricker wavelet) and
+  frequency-domain DFT probes, both repeatable per run
+- Plain-text scene format (spheres/boxes tagged with material constants)
+  for describing geometry, instead of only a hardcoded demo sphere
+- `wavefront-view`: a second binary that renders a snapshot as a 2D slice
+  or a whole-domain volume projection, or a snapshot range as an animated
+  GIF
 
-## See it in action
-
-![A Ricker-pulse wavefront expanding outward through a scene with two dielectric spheres, absorbed by the CPML boundary](assets/demo_wave.gif)
-
-A point source radiating through `scenes/two_spheres.scene` (128³ voxels),
-rendered frame-by-frame with `wavefront-view` into an animated GIF (see
-[Visualize](#visualize)).
-
-| Slice (`--mode slice`) | Volume (`--mode volume`) |
-|---|---|
-| ![2D cross-section of the Ez field](assets/slice_render.png) | ![Maximum-intensity projection through the whole domain](assets/volume_render.png) |
-
-Same underlying snapshot, two render modes: a single 2D cross-section vs. a
-maximum-intensity projection collapsing the *entire* domain into one image.
-
-![Measured vs. theoretical phase velocity error, log-log, vs. cell size](validation/convergence.png)
-
-The solver's numerical dispersion measured against the Yee scheme's own
-exact closed-form prediction — confirming second-order convergence, as
-theory predicts (see [Validation](#validation), `VALIDATION.md`).
-
-![Steps/s vs. thread count, cube vs. tall-thin domain shape, after the fix](benchmarks/thread_scaling.png)
-
-Thread scaling on this workstation, after fixing a halo-exchange bottleneck
-that used to make more threads *slower*, not faster (see
-[Performance](#performance), `PERFORMANCE.md`).
-
-## Why Rust
-
-Rust's ownership model enables thread-safe parallel decomposition without a
-garbage collector, while still allowing the low-level tools this project
-actually needs: SIMD intrinsics, direct memory mapping, and asynchronous
-`io_uring` I/O. The unsafe code that does show up (raw-pointer cross-slab
-access, `mmap`, reinterpreting `FieldBlock`s as raw bytes for the snapshot
-format) is deliberately localized and each instance carries its own inline
-`SAFETY` argument for why it's sound — the type system covers everything
-else, so what remains unsafe is exactly the small, auditable surface where
-the compiler's guarantees run out.
-
-## Implementation
+## Architecture
 
 ```mermaid
 flowchart TD
@@ -123,162 +67,109 @@ flowchart TD
     Viz --> Out["PPM slice/volume image<br/>or animated GIF"]
 ```
 
-Asynchronous, out-of-core 3D Finite-Difference Time-Domain (FDTD)
-electromagnetic simulator. Solves Maxwell's curl equations on a dense
-voxelized material grid (up to ~200 GB, mmap-backed, larger than physical
-RAM), on a single Linux workstation.
+| Component | File |
+|---|---|
+| Material grid (mmap'd, disk-resident) | `src/layout.rs` |
+| Field grid (SIMD-aligned AoSoA blocks) | `src/layout.rs` |
+| Yee update kernels (AVX2, `std::simd`) | `src/fdtd.rs` |
+| Domain decomposition & scheduling | `src/engine.rs` |
+| CPML absorbing boundary | `src/layout.rs` |
+| Snapshot I/O (`O_DIRECT` / `io_uring`) | `src/engine.rs` |
+| Sources / frequency-domain probes | `src/source.rs` / `src/probe.rs` |
+| Scene geometry voxelizer | `src/scene.rs` |
+| Visualization | `src/bin/wavefront-view.rs` |
 
-**[VALIDATION.md](VALIDATION.md)** measures the solver's numerical
-dispersion against the Yee scheme's own exact closed-form prediction
-(confirming second-order convergence — measured order 2.16 vs. theoretical
-2.0) and the CPML absorbing boundary's actual reflection coefficient against
-its configured target — the evidence that this is a numerically correct
-FDTD implementation, not just code that produces plausible-looking output.
+Two binaries share this core via a library crate (`src/lib.rs`):
+`wavefront` (the simulator) and `wavefront-view` (post-processing).
 
-- Material grid: a flat, disk-resident byte array, one byte per voxel,
-  memory-mapped via `memmap2` (`src/layout.rs`).
-- Field grid: `Ex/Ey/Ez/Hx/Hy/Hz`, tiled into `#[repr(align(64))]`
-  Array-of-Structures-of-Arrays blocks sized to the AVX2 `f32x8` lane width
-  (`src/layout.rs`).
-- Solver: SIMD (`std::simd`) Yee-lattice curl update kernels
-  (`src/fdtd.rs`).
-- Scheduling: the grid is decomposed into Z-slabs and fanned out across
-  `rayon`'s work-stealing thread pool. Cross-slab boundary data is read
-  directly out of the shared backing allocation via a raw pointer
-  (`CrossSlabPtr`) rather than copied through a channel -- provably
-  race-free because each phase writes only one field type and reads only
-  the other (`src/engine.rs`; see `PERFORMANCE.md` for the measured
-  scaling impact of this over an earlier `crossbeam-channel`-based design).
-- Boundaries: a graded Convolutional PML (CPML) absorbs outgoing waves at
-  each of the 6 domain faces, so the domain behaves like open space instead
-  of a sealed reflective box. Its auxiliary convolution memory is only
-  allocated for the thin shell of boundary blocks, not the whole volume
-  (`src/layout.rs`'s `PmlContext`/`PmlAuxGrid`, dispatched per-block in
-  `src/engine.rs`).
-- I/O: field snapshots are streamed out via double-buffered, `O_DIRECT`
-  `io_uring` writes (through the `rio` crate), so storage latency never
-  stalls the timestep loop (`src/engine.rs`).
-- Excitation: one or more point soft sources drive a field component every
-  timestep with a configurable time-domain waveform (Gaussian pulse,
-  sinusoid, or Ricker wavelet) -- not just a one-shot initial condition
-  (`src/source.rs`).
-- Frequency-domain probes: a point probe accumulates a running discrete
-  Fourier transform (DFT) at one or more frequencies while the simulation
-  runs, so a driven-sinusoid run can report steady-state amplitude/phase
-  response (resonance, transmission) directly, without streaming and
-  post-processing the full time-domain snapshot history (`src/probe.rs`).
-- Geometry: structures can be described in a small plain-text scene format
-  (spheres and boxes tagged with material constants) and voxelized into the
-  material grid, instead of only the hardcoded demo sphere (`src/scene.rs`).
-- Visualization: `wavefront-view`, a second binary in this crate, renders a
-  2D slice or a whole-domain maximum-intensity projection of one snapshot as
-  a PPM image, or a range of snapshots as an animated GIF, so a run's output
-  can actually be looked at (`src/bin/wavefront-view.rs`).
+## Validation
 
-## Requirements
+- **Second-order convergence**: measured phase-velocity error scales as
+  `dx^2.16` against the Yee scheme's own closed-form prediction of `2.03`
+  — both ≈2.0, the theoretical order for this scheme.
+- **CPML absorption converges to its analytic target**: measured
+  reflection coefficient drops monotonically over a 400× range of layer
+  thickness, closing to `6.4e-6` against a configured target of `1e-6` at
+  the thickest layer tested.
+- **Bit-for-bit deterministic parallel execution**: the same domain run on
+  1 thread vs. many rayon workers produces byte-identical field state.
+- **Checked against the speed of light**: a point source's wavefront
+  arrival time in vacuum matches `distance / c` directly — an independent
+  check from the dispersion analysis above.
 
-- **Rust nightly.** The Yee kernels use `std::simd` (`portable_simd`),
-  which isn't stabilized yet:
+![Measured vs. theoretical phase velocity error, log-log, vs. cell size](validation/convergence.png)
 
-  ```sh
-  rustup toolchain install nightly
-  rustup override set nightly
-  ```
-
-- **Linux**, kernel >= 5.6 (io_uring), ideally >= 5.11.
-- An output path on a filesystem that supports `O_DIRECT` (ext4, xfs, btrfs
-  all work; tmpfs and some network filesystems do not).
-- An x86_64 or aarch64 host. The material grid file needs enough free disk
-  space for `nx * ny * nz` bytes; the snapshot stream needs `snapshot_bytes
-  * (steps / snapshot_every)`.
-
-## Build
-
-Always build in release mode with native-CPU vectorization enabled — this
-is what turns the Maxwell solver's inner loops into real AVX2 instructions
-instead of falling back to scalar code:
+Both studies are hard-gated in CI on every push, not just run once and
+screenshotted. See **[VALIDATION.md](VALIDATION.md)** for full methodology
+— including two dead-end approaches and why they failed — or reproduce
+directly:
 
 ```sh
+cargo +nightly run --release --example convergence_study
+cargo +nightly run --release --example pml_reflection_study
+```
+
+## Performance
+
+- AVX2 vectorization confirmed by disassembling the release binary, not
+  assumed from the `RUSTFLAGS`
+- **+34%** parallel speedup (peak, 4-6 threads) after redesigning the halo
+  exchange to read cross-slab neighbor data directly instead of cloning it
+  through a channel every step — verified bit-for-bit identical to a
+  single-slab reference
+- ~120 MB/s sustained snapshot-writer throughput on this machine's HDD
+  (disk-bound, not solver-bound — real NVMe should sustain more)
+
+![Steps/s vs. thread count, cube vs. tall-thin domain shape, after the fix](benchmarks/thread_scaling.png)
+
+See **[PERFORMANCE.md](PERFORMANCE.md)** for the full halo-exchange
+finding-and-fix story, or reproduce:
+
+```sh
+benchmarks/thread_scaling.sh /path/on/a/real/disk
+benchmarks/snapshot_throughput.sh /path/on/a/real/disk
+```
+
+## Getting Started
+
+Requires **Rust nightly** (the Yee kernels use `std::simd`, not yet
+stabilized) and **Linux** kernel ≥5.6 (`io_uring`), with an
+`O_DIRECT`-capable output filesystem (ext4/xfs/btrfs; not tmpfs).
+
+```sh
+rustup toolchain install nightly && rustup override set nightly
+
 RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
     cargo +nightly build --release
+
+./target/release/wavefront          # runs the demo sphere scenario
+./target/release/wavefront --help   # full flag reference
+
+cargo +nightly test --release       # 34 tests, well under a second
 ```
 
-This produces two binaries, both tuned to the exact machine they were built
-on (`target-cpu=native`) — don't copy them to a different CPU
-microarchitecture; rebuild there instead:
+> **Licensing note:** the `rio` crate (used for `io_uring`) is GPL-3.0 by
+> default; an MIT/Apache-2.0 dual license is available by sponsoring the
+> author. Confirm this is acceptable before distributing a binary built
+> against it.
 
-- `target/release/wavefront` — the simulator.
-- `target/release/wavefront-view` — the snapshot-to-image/animation
-  post-processing tool (see [Visualize](#visualize)).
+## Documentation
 
-Both share the core solver code via a library crate (`src/lib.rs`); the
-simulator binary itself is just `src/main.rs`'s CLI/orchestration layer.
+- **[VALIDATION.md](VALIDATION.md)** — numerical correctness studies
+  (convergence order, CPML reflection coefficient), methodology and
+  results in full
+- **[PERFORMANCE.md](PERFORMANCE.md)** — AVX2 codegen verification,
+  thread-scaling investigation, snapshot-writer throughput
+- `./target/release/wavefront --help` and `wavefront-view --help` — the
+  full CLI flag reference for each binary (sources, probes, scene files,
+  render modes, etc.)
+- On-disk snapshot format: not restated here — see `src/engine.rs`'s
+  `serialize_snapshot` and `src/layout.rs`'s `FieldBlock` doc comments for
+  the exact byte layout, if writing your own reader
 
-> **Licensing note:** the `rio` crate is GPL-3.0 by default (an MIT/Apache-2.0
-> dual license is available by sponsoring the author). Confirm this is
-> acceptable before distributing a binary built against it.
+## Examples
 
-## Run
-
-```sh
-RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
-    cargo +nightly run --release -- [OPTIONS]
-```
-
-or invoke the built binary directly:
-
-```sh
-./target/release/wavefront [OPTIONS]
-```
-
-Absent `--scene`, the demo scenario voxelizes a dielectric sphere
-(`eps_r = 4.0`) at the center of an otherwise-vacuum domain. A single point
-source (default: a Ricker wavelet on `Ez` at the domain center) is
-re-injected every timestep.
-
-### Options
-
-| Flag                    | Meaning                                              | Default              |
-|-------------------------|-------------------------------------------------------|----------------------|
-| `--nx`, `--ny`, `--nz`  | Grid size per axis, in voxels (must be a multiple of 8) | `64`                |
-| `--dx`                  | Uniform cell size, in meters                          | `1.0e-3`             |
-| `--dt`                  | Timestep, in seconds (must satisfy the Courant limit for `dx`) | `1.5e-12`   |
-| `--steps`               | Number of timesteps to run                            | `200`                |
-| `--snapshot-every`      | Timesteps between snapshot writes                     | `20`                 |
-| `--pml-thickness <N>`  | Absorbing boundary depth, in voxels, at each domain face. `0` disables it (fully reflective boundary) | `8` |
-| `--scene <PATH>`        | Plain-text scene file (see below); omit for the demo sphere | (demo sphere) |
-| `--source-x/-y/-z <N>`  | First source's voxel position                        | domain center        |
-| `--source-component <C>`| First source's field component: `ex`, `ey`, `ez`     | `ez`                 |
-| `--source-waveform <W>` | First source's waveform: `gaussian`, `sinusoid`, or `ricker` | `ricker`      |
-| `--source-freq <HZ>`    | First source's drive frequency                        | `1 / (20 * dt)`      |
-| `--source-amplitude <A>`| First source's peak amplitude                         | `1.0`                |
-| `--source <SPEC>`       | Add another source: `key=value,...` (`x`, `y`, `z`, `component`, `waveform`, `freq`, `amplitude`) | (none) |
-| `--probe-x/-y/-z <N>`   | First probe's voxel position -- all three required together with `--probe-freq` to enable it | (disabled) |
-| `--probe-component <C>` | First probe's field component: `ex`, `ey`, `ez`, `hx`, `hy`, `hz` | `ez`  |
-| `--probe-freq <HZ,...>` | Comma-separated frequencies (Hz) the first probe's running DFT tracks | (disabled) |
-| `--probe-start <SECONDS>`| First probe's ignore-samples-before time (skips startup transient) | `0.0` |
-| `--probe <SPEC>`        | Add another probe: `key=value,...` (`x`, `y`, `z`, `component`, `freq` [`;`-separated for multiple], `start`) | (none) |
-| `--materials <PATH>`    | Backing file for the mmap'd material grid             | `materials.grid`     |
-| `--output <PATH>`       | Direct I/O snapshot stream path                       | `wave_trajectory.bin`|
-| `-h`, `--help`          | Print usage                                           |                      |
-
-`engine::run` has always accepted a slice of sources/probes; the
-`--source-*`/`--probe-*` flags above configure only the *first* one
-(auto-created on first use). Repeat `--source`/`--probe` to add more —
-mixing both styles (shorthand for the first, `--source`/`--probe` for
-additional ones) is well-defined, not an error. `--probe`'s `freq` uses `;`
-to separate multiple frequencies (commas are already the `key=value` pair
-separator), so quote the whole value in your shell:
-
-```sh
-./target/release/wavefront \
-    --source-x 5 --source-y 32 --source-z 32 --source-waveform sinusoid --source-freq 3e10 \
-    --source "x=59,y=32,z=32,waveform=ricker,amplitude=0.5" \
-    --probe "x=32,y=32,z=32,freq=3e10;6e10,start=1e-10" \
-    --probe "x=45,y=32,z=32,component=hz,freq=3e10"
-```
-
-### Example
+![A Ricker-pulse wavefront expanding outward through a scene with two dielectric spheres, absorbed by the CPML boundary](assets/demo_wave.gif)
 
 ```sh
 ./target/release/wavefront --nx 128 --ny 128 --nz 128 \
@@ -289,165 +180,25 @@ separator), so quote the whole value in your shell:
     --output /mnt/nvme/wave_trajectory.bin
 ```
 
-`materials.grid` and `wave_trajectory.bin` are working files generated at
-run time (see `.gitignore`) — point `--materials`/`--output` at your NVMe
-mount for large grids rather than leaving the defaults in the repo checkout.
-
-Add `--probe-x/-y/-z`, `--probe-freq`, and (optionally) `--probe-start` to
-get a frequency-domain readout printed after the run, instead of only the
-raw time-domain snapshot stream:
+Then render the output with `wavefront-view`:
 
 ```sh
-./target/release/wavefront --source-waveform sinusoid --source-freq 3e10 \
-    --probe-x 42 --probe-y 32 --probe-z 32 \
-    --probe-freq 3e10 --probe-start 2e-10
+./target/release/wavefront-view \
+    --input /mnt/nvme/wave_trajectory.bin --nx 128 --ny 128 --nz 128 \
+    --snapshots 2:7 --component ez --fps 5 --output wave.gif
 ```
 
-```
-wavefront: probe (42, 32, 32) Ez frequency response:
-  3.0000e10 Hz: amplitude 3.513664e-2, phase -0.1586 rad
-```
+| Slice (`--mode slice`) | Volume (`--mode volume`) |
+|---|---|
+| ![2D cross-section of the Ez field](assets/slice_render.png) | ![Maximum-intensity projection through the whole domain](assets/volume_render.png) |
 
-### Scene format
-
-`--scene` loads a plain-text file describing geometric primitives, applied
-in order (later ones overwrite earlier ones where they overlap). Geometric
-parameters are in voxel-index units, not meters:
+Scene files (`scenes/two_spheres.scene` is a worked example) describe
+spheres/boxes in voxel-index units, one distinct `(eps_r, mu_r, sigma)`
+triple per material:
 
 ```text
-# comment
 sphere <eps_r> <mu_r> <sigma> <cx> <cy> <cz> <radius>
 box    <eps_r> <mu_r> <sigma> <x0> <y0> <z0> <x1> <y1> <z1>
-```
-
-See `scenes/two_spheres.scene` for a working example. Each distinct
-`(eps_r, mu_r, sigma)` triple gets its own material slot automatically (up
-to 255 non-vacuum materials).
-
-### Output format
-
-`wave_trajectory.bin` is a raw concatenation of snapshots; each snapshot is
-every `FieldBlock` in the grid, in block-major (Z, then Y, then X) order,
-each block serialized as six back-to-back `f32` arrays (`Ex, Ey, Ez, Hx, Hy,
-Hz`), 512 voxels per array (8x8x8 block, row-major with X fastest-varying).
-There's no header, so any reader (like `wavefront-view`) needs to already
-know `nx`/`ny`/`nz`.
-
-## Visualize
-
-`wavefront-view` renders one snapshot as a binary PPM image (`.ppm` --
-viewable directly in GIMP, or converted with `magick slice.ppm slice.png`),
-or a range of snapshots as one animated GIF. It needs the same
-`--nx`/`--ny`/`--nz` the simulation was run with, since the trajectory file
-has no header:
-
-```sh
-# One 2D slice of one snapshot, as a PPM:
-./target/release/wavefront-view \
-    --input wave_trajectory.bin --nx 128 --ny 128 --nz 128 \
-    --snapshot 10 --axis z --component energy --output slice.ppm
-
-# A maximum-intensity projection through the whole domain, same snapshot:
-./target/release/wavefront-view \
-    --input wave_trajectory.bin --nx 128 --ny 128 --nz 128 \
-    --snapshot 10 --mode volume --axis z --output volume.ppm
-
-# Every snapshot from 0 to 40, as one looping animated GIF:
-./target/release/wavefront-view \
-    --input wave_trajectory.bin --nx 128 --ny 128 --nz 128 \
-    --snapshots 0:40 --fps 12 --output wave.gif
-```
-
-| Flag                | Meaning                                                    | Default       |
-|---------------------|-------------------------------------------------------------|---------------|
-| `--input <PATH>`    | Trajectory file to read (required)                          |               |
-| `--nx/-ny/-nz <N>`  | Grid dimensions the run used (required)                      |               |
-| `--snapshot <N>`    | Which snapshot to render, 0-indexed                          | `0`           |
-| `--snapshots <A>:<B>` | Render an inclusive snapshot range as one animated GIF instead (requires `--output` to end in `.gif`; mutually exclusive with `--snapshot`) | |
-| `--fps <N>`         | Animation playback rate, for `--snapshots`                  | `10`          |
-| `--mode <slice\|volume>` | `slice`: one 2D cross-section. `volume`: a maximum-intensity projection through the *entire* domain along `--axis` (`--slice` is ignored) | `slice` |
-| `--axis <x\|y\|z>`  | Which axis to hold fixed (`slice`) or project along (`volume`) | `z`         |
-| `--slice <N>`       | Index along `--axis` to slice at (`slice` mode only)         | middle        |
-| `--component <C>`   | `ex`, `ey`, `ez`, `hx`, `hy`, `hz`, or `energy` (sum of squares of all six) | `energy` |
-| `--output <PATH>`   | Output path (`.ppm` for a single snapshot, `.gif` for a range) | `slice.ppm` |
-
-Values are normalized by the maximum magnitude across every frame being
-rendered (a single snapshot's own max, in the single-frame case, so this
-isn't a behavior change there) and mapped through a white-to-red/
-white-to-blue diverging colormap (white-to-red only for `energy`, which is
-never negative). The GIF encoder is hand-written, like the PPM writer --
-real (adaptive-dictionary) LZW compression and a `NETSCAPE2.0` looping
-extension, no image/GIF dependency added.
-
-## Tests
-
-```sh
-RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
-    cargo +nightly test --release
-```
-
-Covers: fixed-point round-tripping, material/PML coefficient formulas
-against their closed forms, Yee kernel invariants (a uniform field has zero
-curl and is left unchanged), scene parsing, source waveform shapes, DFT
-probe amplitude/phase recovery against a known synthetic sinusoid, an
-end-to-end numerical check that a point source in vacuum radiates outward
-at approximately the speed of light, and that multi-slab domain
-decomposition produces bit-for-bit identical output to a single slab
-(`src/engine.rs`'s `CrossSlabPtr` cross-slab halo reads, forced onto local
-1-thread and multi-thread `rayon` pools). Neither of the last two goes
-through `engine::run`'s `O_DIRECT` snapshot writer, so they have no
-filesystem dependency and can't be flaky in a sandboxed CI environment.
-
-CI (`.github/workflows/ci.yml`) builds and tests on nightly with the same
-`RUSTFLAGS` as local development, on every push to `main` and every pull
-request.
-
-## Validation
-
-Two examples are separate, deeper correctness checks, using the same
-field-update kernels the production engine calls. See
-**[VALIDATION.md](VALIDATION.md)** for the methodology and results of both.
-
-`examples/convergence_study.rs` measures the solver's numerical phase
-velocity against the Yee scheme's own exact closed-form dispersion relation
-at four grid resolutions:
-
-```sh
-RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
-    cargo +nightly run --release --example convergence_study
-python3 validation/plot_convergence.py   # regenerates validation/convergence.png
-```
-
-`examples/pml_reflection_study.rs` measures the CPML absorbing boundary's
-actual reflection coefficient at four layer thicknesses, via two-run
-subtraction against a reflection-free reference domain:
-
-```sh
-RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" \
-    cargo +nightly run --release --example pml_reflection_study
-python3 validation/plot_pml_reflection.py   # regenerates validation/pml_reflection.png
-```
-
-## Performance
-
-**[PERFORMANCE.md](PERFORMANCE.md)** confirms the AVX2 vectorization is
-genuinely being emitted (not silently falling back to scalar, verified by
-disassembling the release binary) and measures thread scaling and
-`O_DIRECT` snapshot-writer throughput. It also tells the story of a real
-finding-and-fix: the original `crossbeam-channel`-based halo exchange made
-more `rayon` threads make the solver *slower* on cube-shaped domains
-(-20% at 12 threads); replacing it with direct cross-slab reads
-(`CrossSlabPtr`, `src/engine.rs`) — provably race-free by the same
-disjoint-field-array argument the per-slab kernels already relied on —
-turned that into genuine speedup instead (+25 to +34%), verified
-bit-for-bit identical to a single-slab reference.
-
-```sh
-cargo +nightly test --release engine::             # includes the bit-for-bit multi-slab check
-benchmarks/thread_scaling.sh /path/on/a/real/disk
-python3 benchmarks/plot_thread_scaling.py          # regenerates benchmarks/thread_scaling.png
-python3 benchmarks/plot_halo_fix_before_after.py   # regenerates benchmarks/halo_fix_before_after.png
-benchmarks/snapshot_throughput.sh /path/on/a/real/disk
 ```
 
 ## License
