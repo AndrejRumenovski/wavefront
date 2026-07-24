@@ -17,6 +17,33 @@ code. That's why the numerical claims below are backed by a closed-form
 correctness proof rather than left as an assertion (see `VALIDATION.md`,
 linked just below).
 
+## See it in action
+
+![A Ricker-pulse wavefront expanding outward through a scene with two dielectric spheres, absorbed by the CPML boundary](assets/demo_wave.gif)
+
+A point source radiating through `scenes/two_spheres.scene` (128³ voxels),
+rendered frame-by-frame with `wavefront-view` into an animated GIF (see
+[Visualize](#visualize)).
+
+| Slice (`--mode slice`) | Volume (`--mode volume`) |
+|---|---|
+| ![2D cross-section of the Ez field](assets/slice_render.png) | ![Maximum-intensity projection through the whole domain](assets/volume_render.png) |
+
+Same underlying snapshot, two render modes: a single 2D cross-section vs. a
+maximum-intensity projection collapsing the *entire* domain into one image.
+
+![Measured vs. theoretical phase velocity error, log-log, vs. cell size](validation/convergence.png)
+
+The solver's numerical dispersion measured against the Yee scheme's own
+exact closed-form prediction — confirming second-order convergence, as
+theory predicts (see [Validation](#validation), `VALIDATION.md`).
+
+![Steps/s vs. thread count, cube vs. tall-thin domain shape, after the fix](benchmarks/thread_scaling.png)
+
+Thread scaling on this workstation, after fixing a halo-exchange bottleneck
+that used to make more threads *slower*, not faster (see
+[Performance](#performance), `PERFORMANCE.md`).
+
 ## Implementation
 
 Asynchronous, out-of-core 3D Finite-Difference Time-Domain (FDTD)
