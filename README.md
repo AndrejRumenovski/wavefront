@@ -1,5 +1,24 @@
 # wavefront
 
+## Why this matters
+
+Wavefront is a high-performance electromagnetic simulator that solves
+Maxwell's equations on dense voxelized domains much larger than system
+memory. The project combines computational electromagnetics, high-performance
+computing, numerical analysis, and systems programming into a single Rust
+codebase capable of simulating hundreds of gigabytes of material data on one
+workstation.
+
+It was originally scoped as an HPC-systems exercise — dense out-of-core
+data structures, SIMD numerical kernels, race-free concurrent scheduling,
+asynchronous I/O — and later reframed toward a second goal: making the
+work legible and credible on its own technical merits, not just working
+code. That's why the numerical claims below are backed by a closed-form
+correctness proof rather than left as an assertion (see `VALIDATION.md`,
+linked just below).
+
+## Implementation
+
 Asynchronous, out-of-core 3D Finite-Difference Time-Domain (FDTD)
 electromagnetic simulator. Solves Maxwell's curl equations on a dense
 voxelized material grid (up to ~200 GB, mmap-backed, larger than physical
