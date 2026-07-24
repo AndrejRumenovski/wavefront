@@ -46,6 +46,32 @@ that used to make more threads *slower*, not faster (see
 
 ## Implementation
 
+```mermaid
+flowchart TD
+    Scene["Scene file<br/>scenes/*.scene"] --> Voxelizer["Voxelizer<br/>src/scene.rs"]
+    Voxelizer --> MatGrid["Material Grid<br/>mmap'd — src/layout.rs"]
+    MatGrid --> Engine
+
+    subgraph Engine["FDTD Engine — src/engine.rs"]
+        direction TB
+        FieldGrid["Field Grid<br/>Ex Ey Ez Hx Hy Hz"]
+        SIMD["SIMD Yee update kernels<br/>src/fdtd.rs"]
+        CPML["CPML absorbing boundary<br/>src/layout.rs"]
+        Sources["Point sources<br/>src/source.rs"]
+        Probes["Frequency-domain probes<br/>src/probe.rs"]
+
+        SIMD <--> FieldGrid
+        CPML <--> FieldGrid
+        Sources --> FieldGrid
+        FieldGrid --> Probes
+    end
+
+    Engine --> Writer["Snapshot Writer<br/>double-buffered O_DIRECT / io_uring"]
+    Writer --> Traj["wave_trajectory.bin"]
+    Traj --> Viz["wavefront-view<br/>src/bin/wavefront-view.rs"]
+    Viz --> Out["PPM slice/volume image<br/>or animated GIF"]
+```
+
 Asynchronous, out-of-core 3D Finite-Difference Time-Domain (FDTD)
 electromagnetic simulator. Solves Maxwell's curl equations on a dense
 voxelized material grid (up to ~200 GB, mmap-backed, larger than physical
